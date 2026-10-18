@@ -406,7 +406,7 @@ def super_bot_analysis_order(
     """Return one stable order for strategic and disruptor Super Bots.
 
     During expansion rounds the strategic models establish their plans first,
-    allowing disruptors to select a non-overlapping route from saved drafts.
+    followed by profit-maximising disruptors using the same Super Bot search.
     In the final two official rounds disruptors move first, so strategic models
     can react to their player-pressure decisions.  The optional test round is
     always treated as an early round.

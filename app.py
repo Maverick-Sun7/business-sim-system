@@ -43,8 +43,8 @@ if (
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 6
-    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 13
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 34
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 14
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 35
     or getattr(_ai_training_module, "AI_TRAINING_API_VERSION", 0) < 1
 ):
     importlib.invalidate_caches()
@@ -2066,7 +2066,7 @@ def render_ai_training_setup() -> None:
             value=int(config["disruptor_bot_count"]),
             step=1,
             disabled=not waiting,
-            help="前期跟随榜首约 70% 并避开 Super Bot；最后两轮优先压制玩家 CPI 与二次分配。玩家端只显示为普通 Bot。",
+            help="前期与 Super Bot 一样追求利润和排名，不限制资产高度；只有正式最后两轮才自曝、压制玩家 CPI 与二次分配。玩家端只显示为普通 Bot。",
         )
         rule_cols = st.columns(3)
         selected_rounds = rule_cols[0].number_input(

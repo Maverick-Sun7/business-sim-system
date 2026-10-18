@@ -146,6 +146,25 @@ class BotCompetitionTest(unittest.TestCase):
         )
         self.assertEqual(chosen["name"], "least-loss")
 
+    def test_every_super_can_contest_real_sales_without_being_a_designated_attacker(self):
+        choices = [
+            {"name": "yield-market", "predicted_profit": 100},
+            {"name": "capture-market", "predicted_profit": 96, "targeted_damage": 40,
+             "target_surplus": 10, "target_cpi_drop": 5},
+            {"name": "unnecessary-crash", "predicted_profit": 50, "targeted_damage": 10000},
+        ]
+        chosen = self.bots._select_empirical_super_candidate(
+            choices, 0, tactical_price_allowed=True, contest_market=True,
+        )
+        self.assertEqual(chosen["name"], "capture-market")
+        # Visible CPI suppression without actual lost sales is not a reason
+        # to pay extra: redistribution may still let the rival sell out.
+        choices[1]["targeted_damage"] = 0
+        chosen = self.bots._select_empirical_super_candidate(
+            choices, 0, tactical_price_allowed=True, contest_market=True,
+        )
+        self.assertEqual(chosen["name"], "yield-market")
+
     def test_large_visible_cpi_drop_can_cause_no_target_surplus(self):
         markets = [{
             "city": "A", "market_size": 100_000,

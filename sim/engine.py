@@ -20,7 +20,7 @@ from .db import (
 )
 
 
-ENGINE_API_VERSION = 13
+ENGINE_API_VERSION = 14
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
@@ -230,7 +230,50 @@ def _employee_breakdown(
     return inexperienced, experienced
 
 
-def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
+def preview_round_operations(conn: sqlite3.Connection, round_no: int) -> dict[int, dict[str, Any]]:
+    """Preflight submitted production/investments using real cash and capacity.
+
+    Execute the unchanged operating phase on an isolated in-memory snapshot.
+    Missing smart-Bot decisions become hold-steady placeholders; callers still
+    use their normal rival presets for those unresolved teams. This never
+    alters decisions, money, employees or stock in the authoritative database.
+    """
+    preview = sqlite3.connect(":memory:")
+    try:
+        snapshot = bytearray(conn.serialize())
+        # A serialized WAL database still carries WAL journal header bytes.
+        # The in-memory clone has no -wal sidecar; use rollback-journal header
+        # mode for this private copy (the source database is untouched).
+        snapshot[18:20] = b"\x01\x01"
+        preview.deserialize(bytes(snapshot))
+        preview.row_factory = sqlite3.Row
+        preview.execute("DELETE FROM results WHERE round_no=?", (round_no,))
+        for company in all_rows(preview, "SELECT * FROM companies"):
+            if one(preview, "SELECT 1 FROM decisions WHERE company_id=? AND round_no=?", (company["id"], round_no)):
+                continue
+            home = one(preview, "SELECT * FROM market_config WHERE city=?", (company["home_city"],))
+            if home is None:
+                raise ValueError(f"{company['code']} 尚未设置有效主场。")
+            preview.execute(
+                "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,submitted_at) VALUES(?,?,?,?,?)",
+                (company["id"], round_no,
+                 _previous_salary(preview, int(company["id"]), round_no, "worker_salary", float(home["worker_initial_salary"])),
+                 _previous_salary(preview, int(company["id"]), round_no, "engineer_salary", float(home["engineer_initial_salary"])),
+                 now_iso()),
+            )
+        preview.execute("UPDATE decisions SET is_draft=0,submitted_at=COALESCE(submitted_at,?) WHERE round_no=?", (now_iso(), round_no))
+        states = settle_round(preview, round_no, _operations_only=True)
+        return {
+            int(company_id): {key: state[key] for key in (
+                "available", "produced", "workers", "engineers", "ma_index", "qi_index", "city_decisions", "cash_pre_sales",
+            )}
+            for company_id, state in states.items()
+        }
+    finally:
+        preview.close()
+
+
+def settle_round(conn: sqlite3.Connection, round_no: int, *, _operations_only: bool = False) -> dict[int, dict[str, Any]] | None:
     round_row = one(conn, "SELECT * FROM rounds WHERE round_no=?", (round_no,))
     if round_row is None:
         raise ValueError("回合不存在。")
@@ -252,7 +295,8 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
     # Rollback must restore the exact pre-settlement state, including cohorts
     # and per-city agents. The surrounding transaction also rolls this back if
     # settlement itself fails.
-    capture_round_snapshot(conn, round_no)
+    if not _operations_only:
+        capture_round_snapshot(conn, round_no)
 
     a = get_setting(conn, "component_workers", 3.0)
     b = get_setting(conn, "component_hours", 7.0)
@@ -659,6 +703,9 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "city_investment_units": {str(m["city"]): 0.0 for m in markets},
             "city_breakdown": {str(m["city"]): {} for m in markets},
         }
+
+    if _operations_only:
+        return states
 
     def cpi_entries_for_city(city: str) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []

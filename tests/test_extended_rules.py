@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 class ExtendedRulesTest(unittest.TestCase):
@@ -738,6 +739,12 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertGreater(max(ratios) / min(ratios), 2.5)
 
     def test_all_super_bots_balance_relative_pressure_and_stability_seven_rounds(self):
+        quota_solver = patch(
+            "sim.bots._coordinate_super_bot_prices",
+            side_effect=AssertionError("Competitive SB planning must not reserve shares for rivals"),
+        )
+        quota_solver.start()
+        self.addCleanup(quota_solver.stop)
         db = self.fresh("all-super-seven-rounds.db")
         with db.connect() as conn:
             db.set_setting(conn, "total_rounds", 7)

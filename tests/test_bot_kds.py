@@ -80,6 +80,7 @@ class BotKDSRegressionTest(unittest.TestCase):
                 )
                 self.assertEqual(selected["name"], "unsafe")
 
+
         early_price_profile = self.bots._select_empirical_super_candidate(
             choices,
             6,
@@ -143,6 +144,35 @@ class BotKDSRegressionTest(unittest.TestCase):
             sacrifice_allowed=False,
         )
         self.assertEqual(stable_attack["name"], "unsafe")
+
+    def test_early_secondary_sales_fund_research_without_forcing_a_price_cut(self):
+        from sim.engine import settle_round
+        self.conn.execute("DELETE FROM market_config WHERE city<>'广州'")
+        self.db.set_setting(self.conn, "total_rounds", 7)
+        human = self.company("HUMAN")
+        super_id = self.company("EARLY-SUPER", super_mode=True)
+        for company_id in (human, super_id):
+            self.conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (company_id,))
+        self.conn.execute("UPDATE companies SET product_inventory=100,product_storage_capacity=100 WHERE id=?", (human,))
+        self.conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+        self.conn.execute(
+            "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,management_investment,submitted_at) VALUES(?,1,3300,6400,260000,?)",
+            (human, self.db.now_iso()),
+        )
+        self.conn.execute("INSERT INTO city_decisions(company_id,round_no,city,price) VALUES(?,1,'广州',25000)", (human,))
+        self.bots.submit_super_bot_decisions(self.conn, 1, defer_rebalance=True)
+        decision = self.db.one(self.conn, "SELECT * FROM decisions WHERE company_id=? AND round_no=1", (super_id,))
+        self.assertGreater(decision["research_investment"], 0)
+        self.bots.finalize_super_bot_decisions(self.conn, 1)
+        settle_round(self.conn, 1)
+        result = self.db.one(self.conn, "SELECT * FROM results WHERE company_id=? AND round_no=1", (super_id,))
+        import json
+        report = json.loads(result["report_json"])
+        self.assertGreater(result["net_profit"], 0)
+        self.assertEqual(result["sold"], result["produced"])
+        self.assertEqual(report["research"]["investment"], decision["research_investment"])
+        self.assertGreater(sum(item["secondary_units"] for item in report["sales"]), result["sold"] * 0.50)
+        self.assertGreaterEqual(report["sales"][0]["price"], 24750)
 
     def test_competitive_super_bot_count_is_ranked_and_bounded(self):
         ranked = list(range(1, 10))
@@ -351,6 +381,9 @@ class BotKDSRegressionTest(unittest.TestCase):
     def test_joint_price_pass_preserves_profit_selected_investments(self):
         self.conn.execute("DELETE FROM market_config WHERE city<>'广州'")
         super_id = self.company("SUPER", super_mode=True, cash=1_000_000_000)
+        self.conn.execute("INSERT INTO rounds(round_no,status) VALUES(5,'open')")
+        for role, count in (("worker", 300), ("engineer", 120)):
+            self.conn.execute("INSERT INTO employee_cohorts(company_id,role,count,hire_round) VALUES(?,?,?,4)", (super_id, role, count))
         self.conn.execute("UPDATE companies SET bot_profile=2 WHERE id=?", (super_id,))
         self.conn.execute(
             "INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (super_id,),

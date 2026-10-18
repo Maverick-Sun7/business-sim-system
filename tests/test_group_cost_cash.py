@@ -141,3 +141,26 @@ class GroupCostCashTests(unittest.TestCase):
                 for key in ("cash_difference", "debt_difference", "asset_difference", "net_asset_difference"):
                     self.assertAlmostEqual(recon[key], 0, places=6)
                 self.assertEqual(result["total_assets"], result["cash"])
+
+    def test_bot_preflight_uses_real_capacity_without_changing_source_database(self):
+        from sim.engine import preview_round_operations, settle_round
+        self.conn.execute("UPDATE companies SET cash=1000000 WHERE id=?", (self.id,))
+        self.conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+        self.conn.execute(
+            "INSERT INTO decisions(company_id,round_no,worker_delta,worker_salary,engineer_delta,engineer_salary,production_volume,management_investment,quality_investment,submitted_at) VALUES(?,1,21,3000,8,6000,1000000,5000,36000,?)",
+            (self.id, self.db.now_iso()),
+        )
+        self.conn.execute("INSERT INTO city_decisions(company_id,round_no,city,agent_delta,price) VALUES(?,1,'广州',1,25000)", (self.id,))
+        before = self.conn.serialize()
+        state = preview_round_operations(self.conn, 1)[self.id]
+        self.assertEqual(self.conn.serialize(), before)
+        self.assertEqual(state["produced"], 72)
+        self.assertEqual(state["available"], 72)
+        self.assertEqual(state["qi_index"], 500)
+        settle_round(self.conn, 1)
+        result = self.db.one(self.conn, "SELECT * FROM results WHERE company_id=? AND round_no=1", (self.id,))
+        report = json.loads(result["report_json"])
+        self.assertEqual(result["produced"], state["produced"])
+        self.assertEqual(result["qi_index"], state["qi_index"])
+        self.assertEqual(result["ma_index"], state["ma_index"])
+        self.assertEqual(report["finance"]["cash_before_sales"], state["cash_pre_sales"])

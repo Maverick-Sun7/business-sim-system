@@ -159,8 +159,8 @@ class DisruptorBotTests(unittest.TestCase):
                 self.assertEqual(set(order[2:]), standard_ids, (round_no, order))
                 self.assertEqual(order, list(super_bot_analysis_order(conn, round_no)))
 
-    def test_early_selector_holds_near_seventy_percent_of_leader_assets(self) -> None:
-        """Before the final two rounds, survival/shadowing beats runaway growth."""
+    def test_early_selector_maximizes_profit_without_a_leader_asset_cap(self) -> None:
+        """Early hidden Bots may grow above 70% or even beat the leader."""
         from sim.bots import _select_disruptor_early_candidate
 
         candidates = [
@@ -188,11 +188,12 @@ class DisruptorBotTests(unittest.TestCase):
             leader_assets=100_000_000.0,
         )
         self.assertIsNotNone(selected)
-        self.assertEqual(selected["label"], "shadow")
-        self.assertLessEqual(
-            abs(float(selected["ending_assets"]) / 100_000_000.0 - 0.70),
-            0.05,
-        )
+        self.assertEqual(selected["label"], "runaway")
+        losing_low_price = {"label": "forced-low", "ending_assets": 70_000_000,
+                            "predicted_profit": -10_000_000, "risk_profit": -15_000_000}
+        self.assertEqual(_select_disruptor_early_candidate(
+            [losing_low_price, *candidates], leader_assets=100_000_000,
+        )["label"], "runaway")
 
     def test_late_attack_selector_prioritizes_player_and_secondary_denial(self) -> None:
         """Late self-destruction values human CPI and redistribution suppression."""
