@@ -14,8 +14,8 @@ except ImportError:
 def sample_report() -> dict:
     return {
         "key_metrics": {
-            "total_assets": 18_000_000, "debt": 2_000_000, "net_assets": 16_000_000,
-            "sales_revenue": 10_000_000, "cost": 6_000_000, "net_profit": 4_000_000,
+            "total_assets": 12_800_000, "debt": 2_040_000, "net_assets": 10_760_000,
+            "sales_revenue": 10_000_000, "cost": 4_740_000, "net_profit": 5_260_000,
         },
         "finance": {
             "round_begins": 5_500_000, "starting_debt": 0, "loan_change": 2_000_000,
@@ -26,7 +26,7 @@ def sample_report() -> dict:
             "marketing": 400_000, "quality": 300_000, "management": 200_000,
             "market_reports": 200_000, "research": 0, "transport": 100_000,
             "interest": 40_000, "tax": 800_000, "project_bonus": 500_000,
-            "bonus_in_round_begins": True, "round_ends": 14_000_000,
+            "bonus_in_round_begins": True, "round_ends": 12_800_000,
         },
         "human_resources": {
             "workers": 100, "engineers": 30, "worker_salary": 3_000,
@@ -111,6 +111,21 @@ class OfficialReportPDFTest(unittest.TestCase):
         first, _ = self.build()
         second, _ = self.build()
         self.assertEqual(first, second)
+
+    def test_bonus_used_for_wages_does_not_create_fictitious_negative_cash(self):
+        report = sample_report()
+        report["finance"] = {"round_begins": 100, "starting_debt": 0,
+                             "project_bonus": 90, "bonus_in_round_begins": True,
+                             "worker_wages": 95, "round_ends": 5}
+        report["key_metrics"].update(total_assets=5, debt=0, net_assets=5,
+                                     sales_revenue=0, cost=95, net_profit=-95)
+        pdf = build_round_report_pdf({"code": "C01"}, 1, report, 1, [])
+        text = PdfReader(BytesIO(pdf)).pages[0].extract_text()
+        finance = text[text.index("\nFinance\n"):text.index("Human Resources")]
+        self.assertIn("¥100", finance)
+        self.assertIn("¥5", finance)
+        self.assertNotIn("¥-85", finance)
+        self.assertIn("Project bonus: ¥90", finance)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from .defaults import DEFAULT_MARKETS, DEFAULT_SETTINGS
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.environ.get("SIM_DB_PATH", BASE_DIR / "data" / "sim.db"))
-DB_API_VERSION = 9
+DB_API_VERSION = 10
 
 
 def now_iso() -> str:
@@ -311,6 +311,23 @@ def init_db() -> None:
             conn.execute("ALTER TABLE decisions ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0")
         for key, value in DEFAULT_SETTINGS.items():
             conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
+        if get_setting(conn, "asset_accounting_basis", "", str) != "cash-v1":
+            # Preserve every actual cash payment, stock count and decision.
+            # Only correct the old inventory-inclusive asset/ranking fields,
+            # including the JSON used by both downloadable and web reports.
+            for result in all_rows(conn, "SELECT company_id,round_no,cash,debt,report_json FROM results"):
+                cash = float(result["cash"])
+                debt = float(result["debt"])
+                report = json.loads(result["report_json"])
+                metrics = report.setdefault("key_metrics", {})
+                metrics.update(total_assets=cash, net_assets=cash - debt, inventory_book_value=0.0, asset_basis="cash")
+                metrics.pop("product_inventory_book_value", None)
+                metrics.pop("component_inventory_book_value", None)
+                conn.execute(
+                    "UPDATE results SET total_assets=?,net_assets=?,report_json=? WHERE company_id=? AND round_no=?",
+                    (cash, cash - debt, json.dumps(report, ensure_ascii=False), result["company_id"], result["round_no"]),
+                )
+            set_setting(conn, "asset_accounting_basis", "cash-v1")
         count = one(conn, "SELECT COUNT(*) AS n FROM market_config")
         if count and int(count["n"]) == 0:
             conn.executemany(

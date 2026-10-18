@@ -74,8 +74,9 @@ class SettlementSmokeTest(unittest.TestCase):
                 self.assertAlmostEqual(results[0]["net_assets"], results[0]["total_assets"] - results[0]["debt"])
                 self.assertAlmostEqual(
                     results[0]["net_assets"],
-                    report["finance"]["round_ends"] + report["key_metrics"]["inventory_book_value"] - results[0]["debt"],
+                    report["finance"]["round_ends"] - results[0]["debt"],
                 )
+                self.assertEqual(results[0]["total_assets"], results[0]["cash"])
                 self.assertNotIn("market_average_price", report["sales"][0])
                 self.assertNotIn('market_average_price', json.dumps(report["sales"]))
                 self.assertTrue(next(item for item in report["sales"] if item["city"] == "广州")["report_purchased"])

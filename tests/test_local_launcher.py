@@ -16,6 +16,8 @@ class LocalLauncherTest(unittest.TestCase):
             self.assertIn("启动说明.txt", archive.namelist())
             self.assertIn("worker_payload/local_worker_server.py", archive.namelist())
             self.assertIn("worker_payload/sim/bots.py", archive.namelist())
+            self.assertIn("worker_payload/sim/ai_training.py", archive.namelist())
+            self.assertIn("worker_payload/sim/finance.py", archive.namelist())
             info = archive.getinfo("启动本地算力.command")
             self.assertEqual((info.external_attr >> 16) & 0o777, 0o755)
             script = archive.read(info).decode("utf-8")

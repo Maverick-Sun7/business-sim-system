@@ -38,22 +38,25 @@ from sim import ai_training as _ai_training_module
 # import one consistent version of the application.
 if (
     not hasattr(_db_module, "delete_city")
-    or getattr(_db_module, "DB_API_VERSION", 0) < 9
+    or getattr(_db_module, "DB_API_VERSION", 0) < 10
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 6
-    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 12
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 33
+    or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 13
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 34
     or getattr(_ai_training_module, "AI_TRAINING_API_VERSION", 0) < 1
 ):
     importlib.invalidate_caches()
     importlib.reload(_db_module)
     importlib.reload(_ai_training_module)
     importlib.reload(_cpi_module)
+    importlib.reload(importlib.import_module("sim.finance"))
     importlib.reload(_engine_module)
     importlib.reload(importlib.import_module("sim.bot_market_forecast"))
     importlib.reload(_bots_module)
+    importlib.reload(importlib.import_module("sim.report_pdf"))
+    importlib.reload(importlib.import_module("sim.local_launcher"))
 
 from sim.bots import finalize_super_bot_decisions, submit_bot_decisions
 from sim import remote_worker as _remote_worker_module
@@ -123,6 +126,7 @@ from sim.ai_training import (
 from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
 from sim.engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, market_size, settle_round, weighted_market_average
 from sim.report_pdf import build_round_report_pdf
+from sim.finance import asset_reconciliation, build_finance_ledger
 from sim.kds_pdf import build_public_kds_pdf
 from sim.local_launcher import build_local_worker_launcher_zip
 
@@ -1343,6 +1347,11 @@ def render_player_decision(company: sqlite3.Row) -> None:
         st.error("本轮提交时间已结束，请等待管理员结算。")
         return
 
+    balance_cols = st.columns(2)
+    balance_cols[0].metric("本轮可用现金", money(company["cash"]))
+    balance_cols[1].metric("现有负债", money(company["debt"]))
+    st.caption("总资产就是现金，库存不计资产。工资按三个月支付；工资、材料、仓储、Agent 和 MI → QI → MA 都在销售收入到账前支付。")
+
     widget_prefix = player_decision_widget_prefix(int(company["id"]), round_no)
     with st.container():
         loan_min = -float(company["debt"])
@@ -1642,50 +1651,28 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
     cols[0].metric("销售收入", money(metrics["sales_revenue"]))
     cols[1].metric("总成本", money(metrics["cost"]))
     cols[2].metric("净利润", money(metrics["net_profit"]))
-    st.markdown('<div class="report-note">净利润 = 销售收入 − 全部成本；排名依据 Net Assets（总资产 − 负债），专利、市场报告、运输费、税费和贷款利息均已计入。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="report-note">总资产 = 期末现金，库存不计入资产；净资产 = 期末现金 − 负债。净利润 = 销售收入 − 全部成本，贷款利息计入负债，不重复扣现金。</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="report-title">财务 Finance</div>', unsafe_allow_html=True)
     finance = report["finance"]
-    start_debt = float(finance.get("starting_debt", float(metrics["debt"]) - float(finance.get("loan_change", 0.0)) - float(finance.get("interest", 0.0))))
-    project_bonus = float(finance.get("project_bonus", 0.0))
-    # Older reports removed the already-usable bonus from Round begins and
-    # added it back after tax.  That could display negative intermediate cash
-    # even though the settlement balance never went below zero.  Normalize
-    # both old and new reports to the actual cash available at round start.
-    cash_running = float(finance["round_begins"])
-    if not bool(finance.get("bonus_in_round_begins", False)):
-        cash_running += project_bonus
-    debt_running = start_debt
-    finance_items = [
-        ("期初 / Round begins", 0.0, 0.0),
-        ("银行贷款 / Bank loan", float(finance.get("loan_change", 0.0)), float(finance.get("loan_change", 0.0))),
-        ("工人工资 / Workers salary", -float(finance.get("worker_wages", finance.get("wages", 0.0))), 0.0),
-        ("工程师工资 / Engineers salary", -float(finance.get("engineer_wages", 0.0)), 0.0),
-        ("裁员费用 / Layoff", -float(finance.get("layoff_cash", finance.get("layoff", 0.0))), float(finance.get("layoff_debt", 0.0))),
-        ("离职补偿 / Quit compensation", -float(finance.get("quit_penalty_cash", finance.get("quit_penalty", 0.0))), float(finance.get("quit_penalty_debt", 0.0))),
-        ("培训费用 / Training", -float(finance.get("training", 0.0)), 0.0),
-        ("零件材料 / Components material", -float(finance.get("component_material", finance.get("materials", 0.0))), 0.0),
-        ("零件仓储 / Components storage", -float(finance.get("component_storage", finance.get("storage", 0.0))), 0.0),
-        ("产品材料 / Products material", -float(finance.get("product_material", 0.0)), 0.0),
-        ("产品仓储 / Products storage", -float(finance.get("product_storage", 0.0)), 0.0),
-        ("Agent 变更", -float(finance.get("agents", 0.0)), 0.0),
-        ("营销投入 / Marketing", -float(finance.get("marketing", 0.0)), 0.0),
-        ("品质投入 / Quality", -float(finance.get("quality", 0.0)), 0.0),
-        ("管理投入 / Management", -float(finance.get("management", 0.0)), 0.0),
-        ("销售收入 / Sales revenue", float(metrics["sales_revenue"]), 0.0),
-        ("研发投入 / Research", -float(finance.get("research", 0.0)), 0.0),
-        ("跨城运输 / Transportation", -float(finance.get("transport", 0.0)), 0.0),
-        ("市场报告 / Market report", -float(finance.get("market_reports", 0.0)), 0.0),
-        ("贷款利息 / Debt interest", 0.0, float(finance.get("interest", 0.0))),
-        ("税费 / Tax", -float(finance.get("tax", 0.0)), 0.0),
-        (f"奖励 / Bonus（¥{project_bonus:,.0f}，已计入期初可用现金）", 0.0, 0.0),
+    finance_rows = [
+        {"项目": f"{item['label_zh']} / {item['label_en']}", "现金流": item["cash_flow"],
+         "现金余额": item["cash"], "负债变化": item["debt_change"], "负债余额": item["debt"]}
+        for item in build_finance_ledger(report)
     ]
-    finance_rows = []
-    for label, cash_flow, debt_change in finance_items:
-        cash_running += cash_flow
-        debt_running += debt_change
-        finance_rows.append({"项目": label, "现金流": cash_flow, "现金余额": cash_running, "负债变化": debt_change, "负债余额": debt_running})
     st.dataframe(pd.DataFrame(finance_rows), hide_index=True, use_container_width=True, column_config={key: st.column_config.NumberColumn(format="¥ %.0f") for key in ("现金流", "现金余额", "负债变化", "负债余额")})
+    reconciliation = asset_reconciliation(report)
+    if any(abs(reconciliation[key]) > 0.01 for key in ("cash_difference", "debt_difference", "asset_difference", "net_asset_difference")):
+        st.error("此份历史报表的流水与结余存在差额，请管理员核对备份；表格已保留实际流水，未用期末数字强行覆盖。")
+    investment_shortfalls = [
+        {"投入": label, "提交金额": float(finance[f"{key}_requested"]), "实际支付": float(finance.get(key, 0.0))}
+        for key, label in (("marketing", "MI"), ("quality", "QI"), ("management", "MA"))
+        if f"{key}_requested" in finance
+        and float(finance[f"{key}_requested"]) > float(finance.get(key, 0.0)) + 0.01
+    ]
+    if investment_shortfalls:
+        st.warning("本轮销售前现金不足，以下投入未足额执行；指数按实际支付金额计算。")
+        st.dataframe(pd.DataFrame(investment_shortfalls), hide_index=True, use_container_width=True)
 
     hr = report["human_resources"]
     st.markdown('<div class="report-title">人力资源 Human Resources</div>', unsafe_allow_html=True)

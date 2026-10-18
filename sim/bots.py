@@ -24,7 +24,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round
 
 
-BOT_API_VERSION = 33
+BOT_API_VERSION = 34
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 _FORECAST_POOL_LOCK = threading.Lock()
 _FORECAST_POOL: ProcessPoolExecutor | None = None
@@ -1384,11 +1384,11 @@ def _rebalance_super_bot_production(
                 materials += production * float(home["product_material"]) * material_factor
                 storage = max(
                     0,
-                    old_components + components_to_make - int(row["component_storage_capacity"] or 0),
+                    old_components + components_to_make - max(old_components, int(row["component_storage_capacity"] or 0)),
                 ) * float(home["component_storage"])
                 storage += max(
                     0,
-                    old_products + production - int(row["product_storage_capacity"] or 0),
+                    old_products + production - max(old_products, int(row["product_storage_capacity"] or 0)),
                 ) * float(home["product_storage"])
                 management = ma_index * max(1, workers + engineers)
                 quality = qi_index * max(1.0, old_products * 1.2 + production)
@@ -2322,8 +2322,8 @@ def _submit_bots(
             new_components = components_to_make
             material_cost = new_components * float(home_market["component_material"]) * material_factor
             material_cost += production * float(home_market["product_material"]) * material_factor
-            storage_cost = max(0, old_components + new_components - int(bot["component_storage_capacity"] or 0)) * float(home_market["component_storage"])
-            storage_cost += max(0, old_products + production - int(bot["product_storage_capacity"] or 0)) * float(home_market["product_storage"])
+            storage_cost = max(0, old_components + new_components - max(old_components, int(bot["component_storage_capacity"] or 0))) * float(home_market["component_storage"])
+            storage_cost += max(0, old_products + production - max(old_products, int(bot["product_storage_capacity"] or 0))) * float(home_market["product_storage"])
             management = ma_index_target * max(1, workers + engineers)
             denominator = old_products * 1.2 + production
             quality = qi_index_target * max(1.0, denominator) if use_qi else 0.0

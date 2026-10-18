@@ -4,6 +4,8 @@ from io import BytesIO
 from typing import Any, Callable
 from xml.sax.saxutils import escape
 
+from .finance import build_finance_ledger
+
 
 CITY_NAMES = {
     "广州": "Guangzhou",
@@ -249,48 +251,13 @@ def build_round_report_pdf(
            ("TEXTCOLOR", (0, 2), (-1, 2), muted),
        ])
 
-    project_bonus = float(finance.get("project_bonus", 0))
-    stored_start_cash = float(finance.get("round_begins", 0))
-    bonus_in_start = bool(finance.get("bonus_in_round_begins", False))
-    start_cash = stored_start_cash - project_bonus if bonus_in_start else stored_start_cash
-    start_debt = float(finance.get(
-        "starting_debt",
-        float(metrics.get("debt", 0)) - float(finance.get("loan_change", 0)) - float(finance.get("interest", 0)),
-    ))
-    running_cash = start_cash
-    running_debt = start_debt
     finance_rows: list[list[Any]] = [["Items", "Cash Flow", "Cash", "Debt Change", "Debt"]]
-    finance_rows.append(["Round begins", "--", _money(running_cash), "--", _money(running_debt)])
-    finance_events = [
-        ("Bank loan", float(finance.get("loan_change", 0)), float(finance.get("loan_change", 0))),
-        ("Workers salary cost", -float(finance.get("worker_wages", finance.get("wages", 0))), 0.0),
-        ("Engineers salary cost", -float(finance.get("engineer_wages", 0)), 0.0),
-        ("Layoff compensation", -float(finance.get("layoff_cash", finance.get("layoff", 0))), float(finance.get("layoff_debt", 0))),
-        ("Quit compensation", -float(finance.get("quit_penalty_cash", finance.get("quit_penalty", 0))), float(finance.get("quit_penalty_debt", 0))),
-        ("Employee training cost", -float(finance.get("training", 0)), 0.0),
-        ("Components material cost", -float(finance.get("component_material", finance.get("materials", 0))), 0.0),
-        ("Components storage cost", -float(finance.get("component_storage", finance.get("storage", 0))), 0.0),
-        ("Products material cost", -float(finance.get("product_material", 0)), 0.0),
-        ("Products storage cost", -float(finance.get("product_storage", 0)), 0.0),
-        ("Change sales agents cost", -float(finance.get("agents", 0)), 0.0),
-        ("Marketing investment", -float(finance.get("marketing", 0)), 0.0),
-        ("Quality investment", -float(finance.get("quality", 0)), 0.0),
-        ("Management investment", -float(finance.get("management", 0)), 0.0),
-        ("Sales revenue", float(metrics.get("sales_revenue", finance.get("sales_revenue", 0))), 0.0),
-        ("Market report cost", -float(finance.get("market_reports", 0)), 0.0),
-        ("Research investment", -float(finance.get("research", 0)), 0.0),
-        ("Transportation cost", -float(finance.get("transport", 0)), 0.0),
-        ("Debt interest", 0.0, float(finance.get("interest", 0))),
-        ("Tax deduction", -float(finance.get("tax", 0)), 0.0),
-        ("Project bonus", project_bonus, 0.0),
-    ]
-    for label, cash_change, debt_change in finance_events:
-        running_cash += cash_change
-        running_debt += debt_change
-        finance_rows.append([label, _flow(cash_change), _money(running_cash), _flow(debt_change), _money(running_debt)])
-    finance_rows.append([
-        "Round ends", "--", _money(finance.get("round_ends", running_cash)), "--", _money(metrics.get("debt", running_debt)),
-    ])
+    for event in build_finance_ledger(report):
+        label = f"Project bonus: {_money(finance.get('project_bonus', 0))} (in opening cash)" if event["key"] == "project_bonus" else event["label_en"]
+        finance_rows.append([
+            label, _flow(event["cash_flow"]), _money(event["cash"]),
+            _flow(event["debt_change"]), _money(event["debt"]),
+        ])
 
     hr_rows = hr.get("rows") or [
         {"employee": "Inexperienced Workers", "previous": hr.get("previous_workers", 0), "laid": max(0, -int(hr.get("worker_delta", 0))), "quitted": 0, "added": max(0, int(hr.get("worker_delta", 0))), "promoted": 0, "working": hr.get("workers", 0), "salary": hr.get("worker_salary", 0), "average": hr.get("average_worker_salary", 0)},
@@ -382,6 +349,7 @@ def build_round_report_pdf(
         *notes([
             "Net Profit = Sales Revenue - All Costs. The direct indicator of your achievement in this round.",
             "Net Assets = Total Assets - Debt. Your result till this round, used for ranking.",
+            "Total Assets = Closing Cash. Unsold products and components do not count as assets.",
         ]),
         Spacer(1, 3 * mm), section("Finance"),
         make_table(finance_rows, [54, 34, 37, 32, 38], font_size=6.6,

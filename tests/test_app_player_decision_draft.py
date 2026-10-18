@@ -47,29 +47,35 @@ class PlayerDecisionDraftAppTest(unittest.TestCase):
                 if item.key == "player_navigation"
             )
 
+        def choose(app, label):
+            widget = navigation(app)
+            # Newer Streamlit exposes single-select segmented controls as a
+            # scalar; older AppTest versions used a one-element list.
+            return widget.set_value(label if isinstance(widget.value, str) else [label])
+
         app = AppTest.from_file(self.app_path, default_timeout=30)
         app.session_state["auth"] = {
             "role": "player",
             "company_id": self.company_id,
         }
         app.run()
-        navigation(app).set_value(["决策"]).run()
+        choose(app, "决策").run()
         self.assertFalse(app.exception)
 
         prefix = f"player_decision_draft:{self.company_id}:1:"
         production = app.number_input(key=f"{prefix}production_volume")
         management = app.number_input(key=f"{prefix}management_investment")
         marketing = app.number_input(key=f"{prefix}city:广州:marketing_investment")
-        navigation(app).set_value(["决策"])
+        choose(app, "决策")
         production.set_value(4321).run()
-        navigation(app).set_value(["决策"])
+        choose(app, "决策")
         management.set_value(765_432.0).run()
-        navigation(app).set_value(["决策"])
+        choose(app, "决策")
         marketing.set_value(234_567.0).run()
 
-        navigation(app).set_value(["报表"]).run()
+        choose(app, "报表").run()
         self.assertFalse(app.exception)
-        navigation(app).set_value(["决策"]).run()
+        choose(app, "决策").run()
         self.assertFalse(app.exception)
 
         self.assertEqual(

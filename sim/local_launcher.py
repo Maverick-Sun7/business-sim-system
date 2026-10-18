@@ -11,6 +11,7 @@ _WORKER_FILES = (
     "local_worker_server.py",
     "scf_worker.py",
     "sim/__init__.py",
+    "sim/ai_training.py",
     "sim/bot_joint_pricing.py",
     "sim/bot_market_forecast.py",
     "sim/bots.py",
@@ -18,6 +19,7 @@ _WORKER_FILES = (
     "sim/db.py",
     "sim/defaults.py",
     "sim/engine.py",
+    "sim/finance.py",
     "sim/remote_worker.py",
 )
 

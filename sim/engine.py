@@ -7,6 +7,7 @@ import sqlite3
 from typing import Any
 
 from .cpi import allocate_city_cpi, investment_average_prices
+from .finance import build_finance_ledger
 from .db import (
     all_rows,
     capture_round_snapshot,
@@ -19,7 +20,7 @@ from .db import (
 )
 
 
-ENGINE_API_VERSION = 12
+ENGINE_API_VERSION = 13
 
 
 def market_size(market: sqlite3.Row | dict[str, Any], round_no: int, growth: float) -> float:
@@ -102,24 +103,12 @@ def loan_ceiling_for_round(round_no: int, home_market: dict[str, Any] | sqlite3.
 
 
 def current_company_net_assets(conn: sqlite3.Connection, company: sqlite3.Row | dict[str, Any]) -> float:
-    """Return the latest settled net assets, including unsold inventory value."""
-    latest = one(
-        conn,
-        "SELECT net_assets FROM results WHERE company_id=? AND round_no>=1 ORDER BY round_no DESC LIMIT 1",
-        (int(company["id"]),),
-    )
-    if latest is not None:
-        return float(latest["net_assets"])
-    inventory_value = 0.0
-    component_inventory = int(company["component_inventory"] or 0) if "component_inventory" in company.keys() else 0
-    if company["home_city"] and (int(company["product_inventory"] or 0) > 0 or component_inventory > 0):
-        home = one(conn, "SELECT component_material,product_material FROM market_config WHERE city=?", (company["home_city"],))
-        if home is not None:
-            patent_factor = get_setting(conn, "patent_factor", 0.70)
-            multiplier = float(patent_factor) ** int(company["patents"] or 0)
-            inventory_value = int(company["product_inventory"]) * float(home["product_material"]) * multiplier
-            inventory_value += component_inventory * float(home["component_material"]) * multiplier
-    return float(company["cash"]) + inventory_value - float(company["debt"])
+    """Cash is the competition's only asset; unsold stock is never capital.
+
+    Read the current balance rather than the previous result so an already
+    credited round-opening bonus is also available for the loan calculation.
+    """
+    return float(company["cash"]) - float(company["debt"])
 
 
 def weighted_salary_average(rows: list[tuple[int, float, float]], fallback: float) -> float:
@@ -507,8 +496,11 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         material_multiplier = patent_factor ** active_patents
         old_components = int(company.get("component_inventory", 0))
         old_products = int(company["product_inventory"])
-        component_storage_before = int(company["component_storage_capacity"])
-        product_storage_before = int(company["product_storage_capacity"])
+        # Imported/older games may carry stock without the later-added capacity
+        # fields. Existing stock already has storage: never buy that capacity
+        # again, especially on a zero-production inventory liquidation round.
+        component_storage_before = max(old_components, int(company["component_storage_capacity"]))
+        product_storage_before = max(old_products, int(company["product_storage_capacity"]))
 
         component_requirement = max(1, int(round(components_per_product)))
         # Existing component inventory must be consumed first.  Producing the
@@ -934,13 +926,12 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
         research_success = 1 if random.Random(f"{round_no}:{company_id}:patent").random() < probability else 0
         patents_after = int(state["active_patents"]) + research_success
         research_balance_after = 0.0 if research_success else research_total
-        product_inventory_book_value = inventory * float(home["product_material"]) * (patent_factor ** state["active_patents"])
-        component_inventory_book_value = state["component_surplus"] * float(home["component_material"]) * (patent_factor ** state["active_patents"])
-        inventory_book_value = product_inventory_book_value + component_inventory_book_value
-        total_assets = cash + inventory_book_value
+        # Stock is carried forward for future production/sales, but it does
+        # not count toward cash, total assets, rankings or loan collateral.
+        total_assets = cash
         net_assets = total_assets - debt
         report = {
-            "key_metrics": {"total_assets": total_assets, "debt": debt, "net_assets": net_assets, "sales_revenue": revenue, "cost": total_cost, "net_profit": net_profit, "inventory_book_value": inventory_book_value},
+            "key_metrics": {"total_assets": total_assets, "debt": debt, "net_assets": net_assets, "sales_revenue": revenue, "cost": total_cost, "net_profit": net_profit, "inventory_book_value": 0.0, "asset_basis": "cash"},
             "finance": {
                 "round_begins": report_round_begins, "starting_debt": company["debt"], "loan_base_net_assets": state["loan_base_net_assets"],
                 "loan_ceiling": state["loan_ceiling"], "loan_limit": state["loan_limit"], "loan_change": state["loan_change"],
@@ -952,6 +943,10 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
                 "component_storage": state["component_storage_cost"], "product_storage": state["product_storage_cost"],
                 "materials": state["component_material_cost"] + state["product_material_cost"], "storage": state["storage_cost"],
                 "agents": state["agent_cost"], "marketing": state["marketing_total"], "quality": state["quality"], "management": state["management"],
+                "marketing_requested": sum(float(item["marketing_requested"]) for item in state["city_decisions"].values()),
+                "quality_requested": max(0.0, float(state["decision"]["quality_investment"])),
+                "management_requested": max(0.0, float(state["decision"]["management_investment"])),
+                "cash_before_sales": state["cash_pre_sales"],
                 "sales_revenue": revenue, "research": research, "market_reports": total_report_cost, "transport": transport_cost, "interest": interest, "tax": tax,
                 "project_bonus": project_bonus, "bonus_in_round_begins": True, "round_ends": cash,
             },
@@ -998,6 +993,16 @@ def settle_round(conn: sqlite3.Connection, round_no: int) -> None:
             "sales": city_report_rows,
             "cpi_algorithm": {"version": get_setting(conn, "cpi_algorithm_version", "cpi-generator-admin-v1", str), "description": "赠品 + 第一层 + 第二层 + 福利1/2；价格差按设定幂次分配 40 CPI；各城市独立计算。", "price_power": price_power, "player_average_price_formula": "each investment pool: sum(eligible player price * sold) / sum(eligible player sold); eligible investment >= 50% of that pool's large threshold"},
         }
+        # Reconcile actual paid cash independently of accrued costs. Interest
+        # and unpaid severance increase debt, never cash spending. Fail inside
+        # the settlement transaction rather than publishing an unbalanced round.
+        ledger = build_finance_ledger(report)
+        if (
+            any(not math.isfinite(float(item["cash"])) or float(item["cash"]) < -0.01 for item in ledger)
+            or not math.isclose(float(ledger[-1]["cash"]), cash, rel_tol=1e-12, abs_tol=0.01)
+            or not math.isclose(float(ledger[-1]["debt"]), debt, rel_tol=1e-12, abs_tol=0.01)
+        ):
+            raise ValueError(f"{company['code']} 的现金或负债流水未对平，本轮结果未发布。")
         conn.execute(
             "INSERT INTO results(company_id,round_no,total_assets,debt,net_assets,cash,sales_revenue,total_cost,net_profit,produced,sold,inventory,ma_index,qi_index,research_success,report_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (company_id, round_no, total_assets, debt, net_assets, cash, revenue, total_cost, net_profit, state["produced"], sold, inventory, state["ma_index"], state["qi_index"], research_success, json.dumps(report, ensure_ascii=False)),
