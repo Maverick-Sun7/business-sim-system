@@ -24,7 +24,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, preview_round_operations
 
 
-BOT_API_VERSION = 35
+BOT_API_VERSION = 36
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 _FORECAST_POOL_LOCK = threading.Lock()
 _FORECAST_POOL: ProcessPoolExecutor | None = None
@@ -103,24 +103,41 @@ BOT_STYLES = (
     {"ma": 3.55, "qi": 2.90, "mi": 3.20, "high": 0.970, "cut": 560},
 )
 
-# Ordinary Bots rotate through inexpensive strategy mixes instead of carrying
-# one exaggerated personality through all seven rounds.  These are threshold
-# multipliers (not cash amounts), so they continue to work with a custom KDS.
-# The rotation is O(1): unlike Super Bots, ordinary Bots do not run a search.
+# MA/QI/MI threshold multiples, price stance, expansion pace, MI opening round
+# and city breadth. Independent playbooks use zero to leave out a pool instead
+# of varying only the investment amount inside the same three-pool strategy.
 NORMAL_INVESTMENT_MIXES = (
-    {"ma": 1.05, "qi": 1.04, "mi": 1.03},  # lean balanced
-    {"ma": 1.22, "qi": 1.04, "mi": 1.12},  # MA focus
-    {"ma": 1.05, "qi": 1.28, "mi": 1.08},  # QI focus
-    {"ma": 1.07, "qi": 1.05, "mi": 2.90},  # MI focus
-    {"ma": 1.20, "qi": 1.22, "mi": 1.04},  # MA + QI
-    {"ma": 1.24, "qi": 1.05, "mi": 1.80},  # MA + MI
-    {"ma": 1.05, "qi": 1.22, "mi": 2.30},  # QI + MI
-    {"ma": 1.16, "qi": 1.16, "mi": 1.45},  # broad balanced
-    {"ma": 1.31, "qi": 1.09, "mi": 1.15},
-    {"ma": 1.09, "qi": 1.34, "mi": 1.25},
-    {"ma": 1.11, "qi": 1.11, "mi": 2.65},
-    {"ma": 1.27, "qi": 1.25, "mi": 2.00},
+    (0.002, 0.0, 0.0, "premium", 1.40, 9, 0),
+    (0.0, 0.0, 0.0, "discount", 1.32, 9, 1),
+    (0.0, 1.42, 0.0, "premium", 0.85, 9, 0),
+    (0.0, 0.0, 1.95, "premium", 1.12, 1, 0),
+    (1.12, 1.38, 0.0, "flex", 0.87, 9, 0),
+    (1.43, 0.0, 0.0, "discount", 1.10, 9, 0),
+    (0.0, 1.19, 1.85, "flex", 1.01, 3, 0),
+    (1.24, 0.0, 0.0, "premium", 0.96, 9, 0),
+    (1.06, 1.12, 1.17, "flex", 1.00, 4, 0),
+    (0.0, 1.10, 0.0, "discount", 1.29, 9, 1),
+    (1.33, 0.0, 1.38, "flex", 1.20, 2, 1),
+    (0.0, 0.0, 2.18, "discount", 1.18, 2, 0),
 )
+
+
+def _ordinary_mix(slot: int) -> tuple:
+    # Keep a stable playbook for each seat; cash, pressure and seeded
+    # variation change the actual actions without rerolling its identity.
+    return NORMAL_INVESTMENT_MIXES[slot % len(NORMAL_INVESTMENT_MIXES)]
+
+
+def _ordinary_playbook_order(match_seed: str) -> list[int]:
+    # Keep the core set balanced even in smaller lobbies. Shuffle the
+    # assignment between matches so BOT01 is not always the same opponent.
+    core = list(range(8))
+    additional = list(range(8, len(NORMAL_INVESTMENT_MIXES)))
+    if match_seed:
+        rng = random.Random(match_seed)
+        rng.shuffle(core)
+        rng.shuffle(additional)
+    return core + additional
 
 
 def _super_attack_priority(
@@ -255,56 +272,40 @@ def _select_disruptor_early_candidate(
 def _select_disruptor_attack_candidate(
     candidates: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """Choose a late exact attack, prioritising players and redistribution.
-
-    CPI suppression and denied *investment* secondary allocation are scored
-    before the disruptor's own profit.  This deliberately permits a costly
-    final attack, but only when the settlement forecast shows real lost sales
-    or secondary capacity rather than a cosmetic investment increase.
-    """
+    """Prefer a flat net-asset curve and real low-price shipments."""
     valid = [
         row for row in candidates
         if math.isfinite(float(row.get("predicted_profit", -math.inf)))
     ]
     if not valid:
         return None
-    attacks = [
-        row for row in valid
-        if int(row.get("target_tier", 0)) > 0
-        and (
-            float(row.get("target_cpi_drop", 0.0)) > 0.0
-            or float(row.get("target_secondary_denied", 0.0)) > 0.0
-            or float(row.get("target_surplus", 0.0)) > 0.0
-        )
+    non_loss = [row for row in valid if float(row["predicted_profit"]) >= 0.0]
+    if not non_loss:
+        # No break-even plan found: never trade more cash for nominal CPI.
+        return max(valid, key=lambda row: (
+            float(row["predicted_profit"]), float(row.get("low_price_sold", 0.0)),
+        ))
+    low_price = [row for row in non_loss if float(row.get("low_price_sold", 0.0)) > 0.0]
+    pool = low_price or non_loss
+    flat = [
+        row for row in pool
+        if float(row["predicted_profit"]) <= max(1_000.0, float(row.get("committed_cost", 0.0)) * 0.01)
     ]
-    if not attacks:
-        return max(
-            valid,
-            key=lambda row: (
-                float(row.get("rival_damage", 0.0)),
-                float(row.get("effective_capacity", 0.0)),
-                float(row.get("marketing_total", 0.0)),
-                float(row.get("ma", 0.0)) + float(row.get("qi", 0.0)),
-                -float(row.get("price_ratio", 1.0)),
-            ),
-        )
-    # If a human can actually be hurt, an ordinary/Super Bot cannot distract
-    # the disruptor with a larger but strategically irrelevant profit pool.
-    human_attacks = [row for row in attacks if bool(row.get("target_is_human", False))]
-    pool = human_attacks or attacks
-    best_tier = max(int(row.get("target_tier", 0)) for row in pool)
-    pool = [row for row in pool if int(row.get("target_tier", 0)) == best_tier]
+    if not flat:
+        # Outside the flat band, get as close to break-even as possible while
+        # keeping the low-price route. Do not pick large profit just to grow.
+        return min(pool, key=lambda row: (
+            float(row["predicted_profit"]), -float(row.get("low_price_sold", 0.0)),
+            -float(row.get("predicted_sold", 0.0)),
+        ))
     return max(
-        pool,
+        flat,
         key=lambda row: (
-            float(row.get("target_cpi_drop", 0.0)),
-            float(row.get("target_secondary_denied", 0.0)),
-            float(row.get("target_surplus", 0.0)),
+            float(row.get("low_price_sold", 0.0)),
+            float(row.get("predicted_sold", 0.0)),
+            -float(row["predicted_profit"]),
+            bool(row.get("target_is_human", False)),
             float(row.get("targeted_damage", 0.0)),
-            float(row.get("secondary_capacity", 0.0)),
-            float(row.get("marketing_total", 0.0)),
-            float(row.get("ma", 0.0)) + float(row.get("qi", 0.0)),
-            -float(row.get("price_ratio", 1.0)),
         ),
     )
 
@@ -708,9 +709,13 @@ def _selected_markets(bot: sqlite3.Row | dict[str, Any], markets: list[dict[str,
     return [home_index, *candidates[:max(0, min(len(markets), count) - 1)]]
 
 
-def _bot_rng(bot: sqlite3.Row | dict[str, Any], round_no: int, super_mode: bool) -> random.Random:
+def _bot_rng(
+    bot: sqlite3.Row | dict[str, Any], round_no: int, super_mode: bool, match_seed: str = "",
+) -> random.Random:
     """Stable per-team/per-round randomness, including after a Streamlit rerun."""
     seed_text = f"decision:{bot['id']}:{bot['code']}:{round_no}:{int(super_mode)}"
+    if match_seed:
+        seed_text += f":{match_seed}"
     seed = int.from_bytes(hashlib.sha256(seed_text.encode("utf-8")).digest()[:8], "big")
     return random.Random(seed)
 
@@ -1657,8 +1662,10 @@ def _submit_bots(
                 },
             }
 
+    ordinary_seed = "" if super_mode else get_setting(conn, "ordinary_bot_match_seed", "", str)
+    playbook_order = _ordinary_playbook_order(ordinary_seed)
     selected_by_bot: dict[int, list[int]] = {}
-    for bot in bots:
+    for slot, bot in enumerate(bots):
         wealth_multiple = max(1.0, float(bot["cash"]) / initial_cash)
         # Profitable Bots must deploy their growing capital by opening more
         # real sales capacity. A slow, fixed three-city wealth cap was the main
@@ -1675,6 +1682,15 @@ def _submit_bots(
             market_count = len(markets)
         elif official_round >= total_rounds:
             market_count += 2
+        if not super_mode:
+            role_slot = playbook_order[slot % len(playbook_order)]
+            _, _, _, stance, pace, _, breadth = _ordinary_mix(role_slot)
+            # Multi-market plays deploy surplus capital sooner; specialists
+            # can continue concentrating in fewer cities on the same budget.
+            market_count += breadth
+            market_count += math.floor(wealth_expansion * pace) - wealth_expansion
+            if stance == "premium":
+                market_count = max(1, market_count - 1)
         selected_by_bot[int(bot["id"])] = _selected_markets(bot, markets, min(len(markets), market_count))
     city_competitors: dict[int, int] = {}
     for index, market in enumerate(markets):
@@ -1760,6 +1776,8 @@ def _submit_bots(
             and (late_disruptor or company_id in competitive_super_ids)
         )
         profile = int(bot["bot_profile"] if bot["bot_profile"] is not None else company_id) % 7
+        normal_mix = _ordinary_mix(playbook_order[bot_position % len(playbook_order)])
+        normal_ma, normal_qi, normal_mi, normal_price_stance, normal_pace, normal_mi_start, _ = normal_mix
         profit_target = 0.0
         if super_mode and not late_disruptor:
             previous_super_id = next(
@@ -1775,12 +1793,14 @@ def _submit_bots(
             )
         chosen_predicted_profit: float | None = None
         style = BOT_STYLES[profile]
-        rng = _bot_rng(bot, round_no, super_mode)
+        rng = _bot_rng(bot, round_no, super_mode, ordinary_seed)
         variation = rng.uniform(0.88, 1.14)
         ma_strength = min(4.25, max(0.62, float(style["ma"]) * rng.uniform(0.84, 1.20)))
         qi_strength = min(3.40, max(0.78, float(style["qi"]) * rng.uniform(0.86, 1.18)))
         mi_strength = min(3.60, max(1.03, float(style["mi"]) * rng.uniform(0.88, 1.16)))
         high_price_ratio = min(0.982, max(0.925, float(style["high"]) + rng.uniform(-0.014, 0.014)))
+        if not super_mode and normal_price_stance == "premium":
+            high_price_ratio = rng.uniform(.975, 1.0)
         price_cut = max(50.0, float(style["cut"]) * rng.uniform(0.72, 1.32))
         ma_round_buffer = rng.uniform(0.96, 1.10)
         super_aggression = rng.uniform(1.12, 1.34)
@@ -1890,6 +1910,8 @@ def _submit_bots(
         # field density. The seven-round table supplies only the strategy
         # phase; no historic event's raw unit count leaks into this KDS.
         desired_available = int(fair_market_units * round_market_ramp * variation * capital_scale)
+        if not super_mode:
+            desired_available = int(desired_available * normal_pace)
         prior_production = report.get("production", {})
         prior_sold = 0
         prior_total = 0
@@ -2186,15 +2208,17 @@ def _submit_bots(
             (max(utilization.get(index, 0.0), current_pressure.get(index, 0.0)) for index in selected),
             default=0.0,
         )
-        # QI is opened only when competition/volume justifies another 20% pool.
-        # MI starts from round three, or earlier only in an already crowded city;
-        # whenever it is opened its amount is at least the full large threshold.
+        # Ordinary bots open only their playbook's pools. Super Bots still
+        # evaluate alternate combinations against current competition.
         use_qi = market_pressure >= 0.55 or (plan_index >= 1 and profile in (2, 4, 6) and market_pressure >= 0.30)
         if super_mode:
             # Super Bots evaluate the full QI range; QI=1 is the effective
             # "closed" candidate and therefore costs almost nothing per unit.
             use_qi = True
         use_mi = plan_index >= 2
+        if not super_mode:
+            use_qi = normal_qi > 0
+            use_mi = normal_mi > 0 and official_round >= normal_mi_start
         mi_city_limit = min(
             len(selected),
             1 + max(0, plan_index - 2) // 2 + (1 if plan_index >= 4 and rng.random() > 0.55 else 0),
@@ -2226,18 +2250,18 @@ def _submit_bots(
             * variation
             * ma_strength
         )
-        normal_mix = NORMAL_INVESTMENT_MIXES[(profile + plan_index * 5) % len(NORMAL_INVESTMENT_MIXES)]
         normal_phase = (1.00, 1.08, 1.20, 1.38, 1.58, 1.82, 2.08)[plan_index]
         if not super_mode:
             # Early rounds buy just enough of an opened CPI pool to compete;
-            # later rounds widen naturally. Profiles rotate, so the field has
+            # later rounds widen naturally. Distinct profiles give the field
             # MA-, QI-, MI- and balanced plans without an expensive optimiser.
-            ma_index_target = ma_threshold * max(
-                1.02,
-                float(normal_mix["ma"]) * normal_phase * rng.uniform(0.96, 1.05),
-            )
-            if distress_liquidation:
+            ma_index_target = ma_threshold * normal_ma * normal_phase * rng.uniform(.90, 1.13)
+            if not use_qi and not use_mi and normal_price_stance != "discount":
+                ma_index_target = max(1.0, ma_index_target)
+            if distress_liquidation and normal_ma > .01:
                 ma_index_target = ma_threshold * rng.uniform(1.02, 1.10)
+            elif distress_liquidation:
+                ma_index_target = 0.0
         if super_mode:
             rival_ma = _upper_typical([item["ma"] for index in selected for item in rival_metrics[index]])
             ma_index_target = min(
@@ -2249,11 +2273,15 @@ def _submit_bots(
         if not super_mode:
             qi_index_target = qi_line * max(
                 qi_safe_multiplier,
-                float(normal_mix["qi"]) * normal_phase * rng.uniform(0.95, 1.06),
+                normal_qi * normal_phase * rng.uniform(.90, 1.13),
             )
-            if distress_liquidation:
+            if distress_liquidation and (normal_ma > .01 or cash_ratio < .75):
                 use_qi = False
                 qi_index_target = 0.0
+            elif distress_liquidation:
+                # A quality specialist with working cash may retain a cheap
+                # QI seed on the old stock without buying another large pool.
+                qi_index_target = min(qi_index_target, rng.uniform(1.0, 5.0))
         if super_mode:
             rival_qi = _upper_typical([item["qi"] for index in selected for item in rival_metrics[index]])
             qi_index_target = min(
@@ -2273,7 +2301,7 @@ def _submit_bots(
             if not super_mode:
                 target_mi = threshold * max(
                     1.02,
-                    float(normal_mix["mi"]) * normal_phase * rng.uniform(0.95, 1.06),
+                    normal_mi * normal_phase * rng.uniform(.90, 1.13),
                 )
                 if distress_liquidation:
                     target_mi = 0.0
@@ -2290,9 +2318,7 @@ def _submit_bots(
             marketing_targets[index] = target_mi if index in mi_selected and active_agents else 0.0
 
         if distress_liquidation:
-            # Low-price CPI is the recovery tool. Do not compound the problem
-            # by opening QI/MI pools or research while operating cash is tight.
-            use_qi = False
+            # Don't commit to large fixed MI or research while liquidating.
             use_mi = False
             mi_selected = set()
             marketing_targets = {index: 0.0 for index in marketing_targets}
@@ -2374,8 +2400,26 @@ def _submit_bots(
             use_mi = False
             mi_selected = set()
             marketing_targets = {index: 0.0 for index in marketing_targets}
+        if not super_mode and not use_qi and not use_mi:
+            # Keep an investment route if a discount play cannot go below
+            # the market average without pricing below its production cost.
+            base_unit_cost = (
+                (group_cost - ma_index_target * (group["workers"] + group["engineers"]))
+                / max(1.0, group["products"])
+            )
+            price_pool_reachable = any(
+                min(previous_prices[index], float(markets[index]["max_price"]))
+                > max(price_min, base_unit_cost + (
+                    transport_cost if str(markets[index]["city"]) != home else 0.0
+                )) * 1.03
+                for index in selected
+            )
+            if normal_price_stance != "discount" or not price_pool_reachable:
+                if ma_index_target == 0.0:
+                    group_cost += group["workers"] + group["engineers"]
+                    ma_index_target = 1.0
 
-        opened_investment_pools = 1 + int(use_qi) + int(use_mi)
+        opened_investment_pools = int(ma_index_target > 0) + int(use_qi) + int(use_mi)
         if market_pressure < 0.45:
             target_fraction = rng.uniform(0.54, 0.66)
         elif market_pressure < 0.60:
@@ -2391,6 +2435,8 @@ def _submit_bots(
             city_size = float(market["population"]) * float(market["penetration"]) * growth ** max(0, official_round - 1)
             safe_market_units += city_size * target_fraction / city_competitors[index]
         target_available = int(safe_market_units * variation)
+        if not super_mode:
+            target_available = int(target_available * normal_pace)
         if market_pressure < 0.45:
             target_available = max(target_available, desired_available)
         if prior_production and prior_total > 0:
@@ -2483,6 +2529,15 @@ def _submit_bots(
                     or index in saturated_low_price_indices
                     or (super_mode and (all_super_field or current_pressure.get(index, 0.0) >= 0.60))
                 )
+                if not super_mode:
+                    # A premium specialist keeps its route unless inventory
+                    # distress forces a recovery. Price specialists look for
+                    # below-average entry earlier without going below cost.
+                    low_price_unlocked = (
+                        distress_liquidation
+                        or normal_price_stance == "discount"
+                        or (normal_price_stance == "flex" and low_price_unlocked)
+                    )
                 reference = cap * high_price_ratio
                 if price_ratio_override is not None and index in selected:
                     reference = cap * (
@@ -2521,13 +2576,22 @@ def _submit_bots(
                     not super_mode
                     and index in selected
                     and agents_after > 0
-                    and (late_game_low_price or index in saturated_low_price_indices)
+                    and (normal_price_stance == "discount" or (
+                        normal_price_stance == "flex"
+                        and (late_game_low_price or index in saturated_low_price_indices)
+                    ))
                 )
                 if (distress_liquidation or ordinary_strategic_low_price) and index in selected and agents_after > 0:
                     # Flexible liquidation price: move from the last market
                     # average toward cost as inventory/cash pressure rises.
                     # Never deliberately sell below the real per-unit cost.
-                    cost_floor = max(price_min, direct_unit_cost * 1.03)
+                    cost_floor = max(
+                        price_min,
+                        direct_unit_cost * 1.03,
+                        (float(budget["total"]) / available_units + (
+                            transport_cost if str(market["city"]) != home else 0.0
+                        )) * 1.03 if not super_mode else 0.0,
+                    )
                     average_ceiling = min(cap, max(price_min, previous_price))
                     if distress_liquidation:
                         pressure_depth = (
@@ -2547,7 +2611,9 @@ def _submit_bots(
                             + min(0.16, prior_surplus_ratio * 0.45)
                             + rng.uniform(-0.05, 0.07)
                         )
-                        pressure_depth = min(0.72, max(0.16, pressure_depth))
+                        if normal_price_stance == "discount":
+                            pressure_depth += .24
+                        pressure_depth = min(0.88, max(0.16, pressure_depth))
                     reference = (
                         average_ceiling - (average_ceiling - cost_floor) * pressure_depth
                         if average_ceiling >= cost_floor else cost_floor
@@ -3033,6 +3099,7 @@ def _submit_bots(
                 )
                 if (
                     not force_full_output
+                    and not late_disruptor
                     and not early_expansion
                     and profitable_group_limit < candidate_groups
                 ):
@@ -3240,9 +3307,8 @@ def _submit_bots(
                         key=lambda row: float(row["predicted_profit"]) + float(row["rival_damage"]),
                         reverse=True), 8)
                 if late_disruptor:
-                    # Exact verification, not own profit, decides a self-
-                    # destruct attack. Retain the strongest pressure extremes
-                    # even when their preliminary P&L is deeply negative.
+                    # Keep strong attack routes in the exact shortlist. They
+                    # can win only if low-priced sales cover their costs.
                     include_shortlist(sorted(
                         candidate_values,
                         key=lambda row: float(row.get("rival_damage", 0.0)),
@@ -3259,6 +3325,36 @@ def _submit_bots(
                     key=lambda row: (float(row["price_ratio"]), int(row["groups"])),
                     reverse=True,
                 ), 12)
+
+                # Reserve exact forecasts for low-spend high-price plans at
+                # several affordable volumes. A tiny primary CPI must not
+                # eliminate them before shared secondary stock is allocated.
+                if not late_disruptor and not expansion_room:
+                    for ratio in (1.0, 0.996, 0.95, 0.88):
+                        for ma, qi in ((1.0, 1.0), (1.0, 0.0)):
+                            seed = evaluate_candidate(ma, qi, 0.0, ratio, True, ())
+                            groups = int(seed["groups"])
+                            if groups <= 0 and old_products <= 0:
+                                continue
+                            for amount in sorted({max(1, round(groups * part)) for part in (.22, .40, .65, 1.0)} if groups else {0}):
+                                row = {**seed, "groups": amount, "lean_secondary_route": True}
+                                shortlisted[id(row)] = row
+                if late_disruptor:
+                    # Use full affordable output; vary price around the
+                    # production cost, not volume around visible CPI.
+                    unit_cost = (
+                        base_group_cost + group["workers"] + group["engineers"]
+                    ) / max(1.0, group["products"]) + 1.0
+                    city_caps_by_name = {
+                        str(markets[index]["city"]): min(price_max, float(markets[index]["max_price"]))
+                        for index in selected
+                    }
+                    reference_cap = sum(city_caps_by_name.values()) / max(1, len(city_caps_by_name))
+                    for markup in (.92, .97, 1.0, 1.015, 1.03, 1.06, 1.10, 1.16, 1.25, 1.40, 1.6, 2.0):
+                        ratio = min(1.0, max(price_min, unit_cost * markup) / max(1.0, reference_cap))
+                        row = evaluate_candidate(1.0, 1.0, 0.0, ratio, True, ())
+                        row["uniform_late_price"] = True
+                        shortlisted[id(row)] = row
 
                 # A first-pass CPI estimate can underrate a route that is
                 # eligible for a large price-to-price or investment-to-
@@ -3356,7 +3452,7 @@ def _submit_bots(
                     candidate_available = old_products + int(math.floor(
                         candidate_groups * group["products"]))
                     floor_lock_prices: dict[str, float] = {}
-                    if floor_lock_disruptor:
+                    if floor_lock_disruptor and not candidate.get("uniform_late_price"):
                         lock_options = []
                         market_max_prices: dict[str, float] = {}
                         for (
@@ -3423,7 +3519,7 @@ def _submit_bots(
                     # every other Super Bot, rebuild prices from the ultimately
                     # selected ratio so an optimiser or admin override cannot
                     # be overwritten by a stale forecast value.
-                    if floor_lock_disruptor:
+                    if late_disruptor:
                         candidate["resolved_city_prices"] = {
                             city: float(data["price"])
                             for city, data in own_cities.items()
@@ -3452,10 +3548,11 @@ def _submit_bots(
                     else 1.0 / (1.0 + 0.45 * unresolved_super_peers)
                 )
                 verified_candidates = []
-                for prepared, after_forecast in zip(
-                    prepared_finalists,
-                    _forecast_candidates(forecast_payloads),
-                ):
+                base_prices = {
+                    market["city"]: market["base_average_price"] for market in forecast_markets
+                }
+
+                def score_exact(prepared, after_forecast):
                     candidate, own_cities, candidate_available, actual_budget = prepared
                     own_forecast = after_forecast["companies"][company_id]
                     # Secondary allocation is part of the plan, but an early
@@ -3476,10 +3573,102 @@ def _submit_bots(
                         starting_assets=own_strategy_assets,
                         secondary_confidence=secondary_confidence,
                     )
+                    if late_disruptor:
+                        candidate["low_price_sold"] = sum(
+                            units for city, units in own_forecast["sold_units"].items()
+                            if city in own_cities and own_cities[city]["price"] < base_prices[city]
+                        )
+                        candidate["committed_cost"] = float(actual_budget["total"])
                     if baseline_forecast is not None:
                         candidate.update(_super_target_pressure(
                             baseline_forecast, after_forecast, rival_player_list))
                     verified_candidates.append(candidate)
+
+                for prepared, after_forecast in zip(
+                    prepared_finalists, _forecast_candidates(forecast_payloads),
+                ):
+                    score_exact(prepared, after_forecast)
+
+                # Refine a few plans using settled sales, not visible CPI.
+                # Different output can change the weighted price and the
+                # second pass, so every refinement gets a fresh full forecast.
+                refinements = []
+                refinement_keys = set()
+                lean = sorted(
+                    (p for p in prepared_finalists if p[0].get("lean_secondary_route")),
+                    key=lambda p: float(p[0]["predicted_profit"]), reverse=True,
+                )[:10]
+                for candidate, own_cities, available, _ in lean:
+                    sold = float(candidate["predicted_sold"])
+                    if sold <= 0 or available - sold < group["products"]:
+                        continue
+                    count = max(0, math.ceil((sold - old_products) / group["products"]))
+                    key = (count, candidate["ma"], candidate["qi"], candidate["price_ratio"])
+                    if key in refinement_keys or count >= candidate["groups"]:
+                        continue
+                    refinement_keys.add(key)
+                    ma_index_target = float(candidate["ma"])
+                    qi_index_target = float(candidate["qi"])
+                    marketing_targets = dict(candidate["marketing"])
+                    output = int(math.floor(count * group["products"]))
+                    budget_at_sales = budget_for(output)
+                    if float(budget_at_sales["total"]) <= cash_budget + 1e-9:
+                        refinements.append((
+                            {**candidate, "groups": count}, own_cities,
+                            old_products + output, budget_at_sales,
+                        ))
+
+                if late_disruptor:
+                    flat_seeds = sorted(
+                        (p for p in prepared_finalists
+                         if p[0].get("uniform_late_price") and p[0]["low_price_sold"] > 0),
+                        key=lambda p: abs(float(p[0]["predicted_profit"])),
+                    )[:3]
+                    for candidate, own_cities, available, cost in flat_seeds:
+                        revenue = float(candidate["predicted_revenue"])
+                        if revenue <= 0:
+                            continue
+                        # Find the near break-even quote at the observed sales
+                        # mix. This is a probe, not an assumption of monotone CPI.
+                        cost_to_cover = (
+                            float(cost["total"]) + forecast_interest
+                            + float(candidate["predicted_transport"])
+                        )
+                        for margin in (.001, .005):
+                            scale = (1 + margin) * cost_to_cover / revenue
+                            adjusted = {
+                                city: {**route, "price": min(
+                                    city_caps_by_name[city],
+                                    max(price_min, float(route["price"]) * scale),
+                                )}
+                                for city, route in own_cities.items()
+                            }
+                            key = (
+                                candidate["groups"],
+                                tuple(round(float(route["price"]), 4) for route in adjusted.values()),
+                            )
+                            if key in refinement_keys:
+                                continue
+                            refinement_keys.add(key)
+                            refinements.append((
+                                {**candidate, "resolved_city_prices": {
+                                    city: route["price"] for city, route in adjusted.items()
+                                }},
+                                adjusted, available, cost,
+                            ))
+                refinement_payloads = [
+                    dict(forecast_args, players=[
+                        *rival_player_list,
+                        {"company_id": company_id, "available": available,
+                         "ma_index": float(candidate["ma"]), "qi_index": float(candidate["qi"]),
+                         "cities": cities},
+                    ])
+                    for candidate, cities, available, _ in refinements
+                ]
+                for prepared, after_forecast in zip(
+                    refinements, _forecast_candidates(refinement_payloads),
+                ):
+                    score_exact(prepared, after_forecast)
                 ma_index_target, qi_index_target, marketing_targets = saved_targets
                 finalist_candidates = verified_candidates
             else:

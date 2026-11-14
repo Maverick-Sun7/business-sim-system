@@ -172,7 +172,7 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertGreater(pre_sales_spending, float(finance["round_begins"]) * 0.75)
             self.assertGreater(report["production"]["produced"], 0)
 
-    def test_bot_opens_threshold_investments_in_order_and_prices_by_saturation(self):
+    def test_premium_bot_starts_light_then_can_clear_surplus(self):
         db = self.fresh("bot-strategy.db")
         company_id = self.one_company(db)
         from sim.bots import submit_bot_decisions
@@ -184,7 +184,8 @@ class ExtendedRulesTest(unittest.TestCase):
             first = db.one(conn, "SELECT * FROM decisions WHERE company_id=? AND round_no=1", (company_id,))
             city_first = db.one(conn, "SELECT * FROM city_decisions WHERE company_id=? AND round_no=1 AND city='广州'", (company_id,))
             headcount = first["worker_delta"] + first["engineer_delta"]
-            self.assertGreater(first["management_investment"] / max(1, headcount), 1300)
+            self.assertGreater(first["management_investment"] / max(1, headcount), 0)
+            self.assertLess(first["management_investment"] / max(1, headcount), 10)
             self.assertEqual(first["quality_investment"], 0)
             self.assertEqual(city_first["marketing_investment"], 0)
             self.assertGreaterEqual(city_first["price"], 25_000 * 0.94)
@@ -203,14 +204,20 @@ class ExtendedRulesTest(unittest.TestCase):
             previous_average = first_report["human_resources"]["average_worker_salary"]
             self.assertGreaterEqual(second["worker_salary"], previous_average * 1.05 - 1e-6)
             self.assertLessEqual(second["worker_salary"], previous_average * 1.10 + 1e-6)
-            self.assertGreater(second["quality_investment"], second["production_volume"] * 500)
+            self.assertEqual(second["quality_investment"], 0)
             self.assertEqual(city_second["marketing_investment"], 0)
-            self.assertGreaterEqual(city_second["price"], 25_000 * 0.75)
+            # A premium specialist may still discount after failing to sell
+            # half its stock. The prior-round settlement drives that choice.
+            prev_production = first_report["production"]
+            if prev_production["sold"] < prev_production["produced"] * 0.50:
+                self.assertLess(city_second["price"], 12000)
+            else:
+                self.assertGreaterEqual(city_second["price"], 25_000 * 0.75)
             settle_round(conn, 2)
             conn.execute("INSERT INTO rounds(round_no,status) VALUES(3,'open')")
             submit_bot_decisions(conn, 3)
             city_third = db.one(conn, "SELECT * FROM city_decisions WHERE company_id=? AND round_no=3 AND city='广州'", (company_id,))
-            self.assertGreater(city_third["marketing_investment"], 0)
+            self.assertEqual(city_third["marketing_investment"], 0)
 
     def test_bot_uses_full_group_budget_even_when_inventory_is_large(self):
         db = self.fresh("bot-layoff.db")
@@ -511,7 +518,10 @@ class ExtendedRulesTest(unittest.TestCase):
                 for row in decisions
             }
             self.assertGreaterEqual(len({round(float(row["price"]), 2) for row in prices}), 5)
-            self.assertGreaterEqual(len(ma_indices), 5)
+            # Some bots deliberately skip MA and compete via QI, MI or price.
+            self.assertIn(0.0, ma_indices)
+            self.assertTrue(any(0 < index < 10 for index in ma_indices))
+            self.assertTrue(any(index > 1300 for index in ma_indices))
             self.assertTrue(all(float(row["research_investment"]) == 8_150_000 for row in decisions))
 
     def test_bots_with_repeated_profiles_still_choose_distinct_numbers(self):
@@ -640,11 +650,12 @@ class ExtendedRulesTest(unittest.TestCase):
             self.assertGreater(int(city_result["sold"]), 0)
             self.assertGreater(float(json.loads(city_result["breakdown_json"])["price_cpi"]), 0.0)
 
-    def test_regular_bot_prefers_low_price_in_saturated_market_and_last_two_rounds(self):
+    def test_flexible_regular_bot_prefers_low_price_in_saturated_market_and_last_two_rounds(self):
         db = self.fresh("bot-strategic-low-price.db")
         company_id = self.one_company(db, 30_000_000)
-        from sim.bots import submit_bot_decisions
-        with db.connect() as conn:
+        from sim.bots import _ordinary_mix, submit_bot_decisions
+        flexible = _ordinary_mix(4)
+        with db.connect() as conn, patch("sim.bots._ordinary_mix", return_value=flexible):
             db.set_setting(conn, "total_rounds", 5)
             conn.execute(
                 "UPDATE companies SET is_bot=1,bot_profile=1,home_city='广州' WHERE id=?",
@@ -699,12 +710,12 @@ class ExtendedRulesTest(unittest.TestCase):
                 len(remaining_ids),
             )
 
-    def test_round_three_mi_is_above_large_threshold_and_varied(self):
+    def test_regular_bot_portfolios_are_diverse_and_active_mi_crosses_threshold(self):
         db = self.fresh("bot-mi-range.db")
         first_id = self.one_company(db, 30_000_000)
         with db.connect() as conn:
             markets = [row["city"] for row in db.all_rows(conn, "SELECT city FROM market_config ORDER BY city")]
-            for profile in range(7):
+            for profile in range(12):
                 if profile == 0:
                     company_id = first_id
                     conn.execute(
@@ -715,12 +726,23 @@ class ExtendedRulesTest(unittest.TestCase):
                     cursor = conn.execute(
                         "INSERT INTO companies(code,name,password_hash,home_city,cash,is_bot,bot_profile,setup_submitted_at,created_at) "
                         "VALUES(?,?,?,?,30000000,1,?,?,?)",
-                        (f"BOT{profile + 1:02d}", f"Bot {profile + 1}", db.hash_password("x"), markets[profile], profile, db.now_iso(), db.now_iso()),
+                        (f"BOT{profile + 1:02d}", f"Bot {profile + 1}", db.hash_password("x"), markets[profile % len(markets)], profile, db.now_iso(), db.now_iso()),
                     )
                     company_id = int(cursor.lastrowid)
-                conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (company_id, markets[profile]))
+                conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (company_id, markets[profile % len(markets)]))
             from sim.bots import submit_bot_decisions
-            self.assertEqual(submit_bot_decisions(conn, 3), 7)
+            self.assertEqual(submit_bot_decisions(conn, 3), 12)
+            portfolios = {
+                (float(row["ma"]) > 0, float(row["qi"]) > 0, float(row["mi"]) > 0)
+                for row in db.all_rows(conn,
+                    "SELECT d.management_investment AS ma,d.quality_investment AS qi,"
+                    "SUM(cd.marketing_investment) AS mi FROM decisions d JOIN city_decisions cd "
+                    "ON d.company_id=cd.company_id AND d.round_no=cd.round_no "
+                    "WHERE d.round_no=3 GROUP BY d.company_id")
+            }
+            self.assertTrue({(True, False, False), (False, True, False),
+                             (False, False, True), (True, True, False),
+                             (True, False, True), (False, True, True)} <= portfolios)
             ratios = []
             for row in db.all_rows(
                 conn,
@@ -734,9 +756,21 @@ class ExtendedRulesTest(unittest.TestCase):
                 large = (float(row["max_price"]) / 50.0) * size * 0.20
                 large /= (1.0 + int(row["agents"]) * 0.10) * 1.5 * 2.0
                 ratios.append(float(row["marketing_investment"]) / large)
-            self.assertEqual(len(ratios), 7)
+            self.assertGreaterEqual(len(ratios), 3)
             self.assertGreaterEqual(min(ratios), 1.0)
-            self.assertGreater(max(ratios) / min(ratios), 2.5)
+            self.assertGreater(max(ratios) / min(ratios), 1.2)
+
+    def test_ordinary_bot_playbooks_vary_by_match_without_duplicate_slots(self):
+        from sim.bots import _ordinary_playbook_order
+
+        first = _ordinary_playbook_order("practice-one")
+        second = _ordinary_playbook_order("practice-two")
+        self.assertEqual(first, _ordinary_playbook_order("practice-one"))
+        self.assertNotEqual(first, second)
+        for order in (first, second):
+            self.assertEqual(set(order[:8]), set(range(8)))
+            self.assertEqual(set(order), set(range(12)))
+            self.assertEqual(len(order), 12)
 
     def test_all_super_bots_balance_relative_pressure_and_stability_seven_rounds(self):
         quota_solver = patch(

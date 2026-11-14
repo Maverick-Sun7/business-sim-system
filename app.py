@@ -44,7 +44,7 @@ if (
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 6
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 14
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 35
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 36
     or getattr(_ai_training_module, "AI_TRAINING_API_VERSION", 0) < 1
 ):
     importlib.invalidate_caches()
@@ -2050,6 +2050,7 @@ def render_ai_training_setup() -> None:
             value=int(config["bot_count"]),
             step=1,
             disabled=not waiting,
+            help="建议 8–10 支普通 Bot。前 12 支使用不同的基础打法；超过 12 支会重复使用打法，但投入、定价和市场选择仍会变化。",
         )
         super_bot_count = count_cols[2].number_input(
             "Super Bot 数量",
@@ -2066,7 +2067,7 @@ def render_ai_training_setup() -> None:
             value=int(config["disruptor_bot_count"]),
             step=1,
             disabled=not waiting,
-            help="前期与 Super Bot 一样追求利润和排名，不限制资产高度；只有正式最后两轮才自曝、压制玩家 CPI 与二次分配。玩家端只显示为普通 Bot。",
+            help="前期与 Super Bot 一样争利润；正式最后两轮优先低价出货，尽量盈亏持平，不按初分 CPI 自动控货。玩家端只显示普通 Bot。",
         )
         rule_cols = st.columns(3)
         selected_rounds = rule_cols[0].number_input(
@@ -2185,7 +2186,7 @@ def render_admin_companies() -> None:
         add_super_bots = bot_cols[3].form_submit_button("添加超级 Bot", disabled=not setup_editable, use_container_width=True)
         disruptor_bot_count = bot_cols[4].number_input("新增自曝 Bot 数量", min_value=1, max_value=10, value=1, step=1, disabled=not setup_editable)
         add_disruptor_bots = bot_cols[5].form_submit_button("添加自曝 Bot", disabled=not setup_editable, use_container_width=True)
-        st.caption("普通 Bot 开轮立即提交；Super Bot 与自曝 Bot 读取全场数据。自曝 Bot 的特殊身份仅管理员可见。")
+        st.caption("普通 Bot 开轮立即提交，建议配置 8–10 支，最多 12 支可各用一套基础打法。Super Bot 与自曝 Bot 读取全场数据；自曝身份仅管理员可见。")
     if add_bots or add_super_bots or add_disruptor_bots:
         if not markets:
             st.error("请先创建至少一个可选主场。")

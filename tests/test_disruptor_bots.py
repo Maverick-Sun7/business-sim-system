@@ -195,101 +195,32 @@ class DisruptorBotTests(unittest.TestCase):
             [losing_low_price, *candidates], leader_assets=100_000_000,
         )["label"], "runaway")
 
-    def test_late_attack_selector_prioritizes_player_and_secondary_denial(self) -> None:
-        """Late self-destruction values human CPI and redistribution suppression."""
+    def test_late_attack_prefers_low_price_volume_at_break_even(self) -> None:
         from sim.bots import _select_disruptor_attack_candidate
 
-        candidates = [
-            {
-                "label": "passive-profit",
-                "predicted_profit": 50_000_000.0,
-                "risk_profit": 45_000_000.0,
-                "target_tier": 0,
-                "target_is_human": False,
-                "target_cpi_drop": 0.0,
-                "target_secondary_denied": 0.0,
-            },
-            {
-                "label": "hit-super",
-                "predicted_profit": 5_000_000.0,
-                "risk_profit": 0.0,
-                "target_tier": 4,
-                "target_is_human": False,
-                "target_cpi_drop": 14.0,
-                "target_secondary_denied": 8_000.0,
-            },
-            {
-                "label": "hit-player-primary-only",
-                "predicted_profit": -10_000_000.0,
-                "risk_profit": -15_000_000.0,
-                "target_tier": 5,
-                "target_is_human": True,
-                "target_cpi_drop": 10.0,
-                "target_secondary_denied": 500.0,
-            },
-            {
-                "label": "hit-player-both-pools",
-                "predicted_profit": -30_000_000.0,
-                "risk_profit": -40_000_000.0,
-                "target_tier": 5,
-                "target_is_human": True,
-                "target_cpi_drop": 10.0,
-                "target_secondary_denied": 12_000.0,
-            },
-        ]
-        selected = _select_disruptor_attack_candidate(candidates)
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["label"], "hit-player-both-pools")
-        self.assertTrue(selected["target_is_human"])
-        self.assertGreater(float(selected["target_cpi_drop"]), 0.0)
-        self.assertGreater(float(selected["target_secondary_denied"]), 0.0)
+        def plan(profit, low_sold, sold, damage=0):
+            return {
+                "predicted_profit": profit, "low_price_sold": low_sold,
+                "predicted_sold": sold, "committed_cost": 10_000_000,
+                "targeted_damage": damage,
+            }
 
-    def test_late_attack_selector_ignores_own_profit_when_pressure_is_stronger(
-        self,
-    ) -> None:
-        """Flipping enormous own profits cannot overturn a stronger attack."""
+        flat_volume = plan(38_000, 1500, 2000)
+        self.assertIs(_select_disruptor_attack_candidate([
+            plan(25_000, 1200, 1700), flat_volume,
+            plan(1_000_000, 2200, 3000),
+            plan(1000, 0, 3000),
+            plan(-5_000_000, 2900, 4100, damage=50_000_000),
+        ]), flat_volume)
+
+    def test_late_attack_falls_back_to_non_loss_or_smallest_loss(self) -> None:
         from sim.bots import _select_disruptor_attack_candidate
 
-        stronger_pressure = {
-            "label": "stronger-pressure",
-            "target_tier": 5,
-            "target_is_human": True,
-            "target_cpi_drop": 10.01,
-            "target_secondary_denied": 20_001.0,
-            "predicted_profit": -9_000_000_000.0,
-            "risk_profit": -9_500_000_000.0,
-        }
-        weaker_pressure = {
-            "label": "weaker-pressure",
-            "target_tier": 5,
-            "target_is_human": True,
-            "target_cpi_drop": 10.0,
-            "target_secondary_denied": 20_000.0,
-            "predicted_profit": 9_000_000_000.0,
-            "risk_profit": 8_500_000_000.0,
-        }
-        selected = _select_disruptor_attack_candidate(
-            [weaker_pressure, stronger_pressure]
-        )
-        self.assertEqual(selected["label"], "stronger-pressure")
-
-        # Prove profit is not merely given a small weight: swap both profit
-        # extremes while leaving the attack forecast untouched.  Selection
-        # must remain identical because a late disruptor ranks pressure first.
-        stronger_pressure = {
-            **stronger_pressure,
-            "predicted_profit": 9_000_000_000.0,
-            "risk_profit": 8_500_000_000.0,
-        }
-        weaker_pressure = {
-            **weaker_pressure,
-            "predicted_profit": -9_000_000_000.0,
-            "risk_profit": -9_500_000_000.0,
-        }
-        selected_after_profit_swap = _select_disruptor_attack_candidate(
-            [weaker_pressure, stronger_pressure]
-        )
-        self.assertEqual(selected_after_profit_swap["label"], "stronger-pressure")
+        flat = {"predicted_profit": 0, "predicted_sold": 600}
+        small_loss = {"predicted_profit": -900, "low_price_sold": 1200}
+        large_loss = {"predicted_profit": -2000, "low_price_sold": 2300}
+        self.assertIs(_select_disruptor_attack_candidate([large_loss, flat]), flat)
+        self.assertIs(_select_disruptor_attack_candidate([large_loss, small_loss]), small_loss)
 
     def test_floor_lock_prices_only_one_disruptor_and_respects_inventory_reach(
         self,

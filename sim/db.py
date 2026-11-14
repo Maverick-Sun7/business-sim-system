@@ -593,6 +593,7 @@ def start_competition(conn: sqlite3.Connection, duration_minutes: int, use_test_
     start = datetime.now(timezone.utc)
     end = start + timedelta(minutes=max(1, int(duration_minutes)))
     set_setting(conn, "test_round_enabled", int(bool(use_test_round)))
+    set_setting(conn, "ordinary_bot_match_seed", secrets.token_hex(8))
     set_setting(conn, "final_results_release_round", 0)
     set_setting(conn, "ai_training_processing_round", 0)
     set_setting(conn, "ai_training_processing_started_at", "")
