@@ -159,6 +159,36 @@ class DisruptorBotTests(unittest.TestCase):
                 self.assertEqual(set(order[2:]), standard_ids, (round_no, order))
                 self.assertEqual(order, list(super_bot_analysis_order(conn, round_no)))
 
+
+    def test_late_super_search_uses_disruptor_draft_saved_before_it(self) -> None:
+        from sim import ai_training, bots
+
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM market_config WHERE city<>'广州'")
+            ai_training.configure_ai_training_roster(conn, 0, 0, 1, disruptor_bot_count=1)
+            self.db.set_setting(conn, "total_rounds", 5)
+            conn.execute("INSERT INTO rounds(round_no,status) VALUES(4,'open')")
+            disruptor, standard = ai_training.super_bot_analysis_order(conn, 4)
+            def price_seen(payloads):
+                for payload in payloads:
+                    own = payload["players"][-1]
+                    if own["company_id"] == standard:
+                        rival = next(player for player in payload["players"] if player["company_id"] == disruptor)
+                        observed.add(rival["cities"]["广州"]["price"])
+                return forecast_candidates(payloads)
+
+            observed = set()
+            forecast_candidates = bots._forecast_candidates
+            with patch.object(bots, "_forecast_candidates", side_effect=price_seen):
+                self.assertEqual(bots.submit_super_bot_decisions(conn, 4, defer_rebalance=True), 2)
+            draft = self.db.one(
+                conn, "SELECT cd.price,d.is_draft FROM city_decisions cd JOIN decisions d "
+                "ON cd.company_id=d.company_id AND cd.round_no=d.round_no "
+                "WHERE cd.company_id=? AND cd.round_no=4 AND cd.city='广州'", (disruptor,),
+            )
+            self.assertEqual(draft["is_draft"], 1)
+            self.assertEqual(observed, {float(draft["price"])})
+
     def test_early_selector_maximizes_profit_without_a_leader_asset_cap(self) -> None:
         """Early hidden Bots may grow above 70% or even beat the leader."""
         from sim.bots import _select_disruptor_early_candidate
@@ -221,6 +251,14 @@ class DisruptorBotTests(unittest.TestCase):
         large_loss = {"predicted_profit": -2000, "low_price_sold": 2300}
         self.assertIs(_select_disruptor_attack_candidate([large_loss, flat]), flat)
         self.assertIs(_select_disruptor_attack_candidate([large_loss, small_loss]), small_loss)
+
+    def test_late_attack_near_break_even_does_not_favor_tiny_shipments(self) -> None:
+        from sim.bots import _select_disruptor_attack_candidate
+
+        tiny = {"predicted_profit": 3_000, "low_price_sold": 10, "predicted_sold": 10}
+        competitive = {"predicted_profit": 6_000, "low_price_sold": 940, "predicted_sold": 1_000}
+        largest = {"predicted_profit": 15_000, "low_price_sold": 1_000, "predicted_sold": 1_000}
+        self.assertIs(_select_disruptor_attack_candidate([tiny, competitive, largest]), competitive)
 
     def test_floor_lock_prices_only_one_disruptor_and_respects_inventory_reach(
         self,

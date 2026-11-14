@@ -8,6 +8,7 @@ import random
 import sqlite3
 import threading
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing
 from typing import Any, Callable
 
 from .bot_joint_pricing import JointPriceTarget, solve_joint_prices
@@ -24,7 +25,7 @@ from .db import all_rows, effective_employee_count, employee_count, get_setting,
 from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, preview_round_operations
 
 
-BOT_API_VERSION = 36
+BOT_API_VERSION = 37
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 _FORECAST_POOL_LOCK = threading.Lock()
 _FORECAST_POOL: ProcessPoolExecutor | None = None
@@ -292,8 +293,11 @@ def _select_disruptor_attack_candidate(
         if float(row["predicted_profit"]) <= max(1_000.0, float(row.get("committed_cost", 0.0)) * 0.01)
     ]
     if not flat:
-        # Outside the flat band, get as close to break-even as possible while
-        # keeping the low-price route. Do not pick large profit just to grow.
+        # Do not pick a near-zero shipment solely to get closer to zero.
+        # Keep plans that can still ship most of the best low-price volume.
+        volume_key = "low_price_sold" if low_price else "predicted_sold"
+        best_volume = max(float(row.get(volume_key, 0.0)) for row in pool)
+        pool = [row for row in pool if float(row.get(volume_key, 0.0)) >= best_volume * 0.90]
         return min(pool, key=lambda row: (
             float(row["predicted_profit"]), -float(row.get("low_price_sold", 0.0)),
             -float(row.get("predicted_sold", 0.0)),
@@ -1244,6 +1248,10 @@ def _rebalance_super_bot_production(
     all_super_field = not bool(one(
         conn, "SELECT 1 FROM companies WHERE is_super_bot=0 LIMIT 1",
     ))
+    explore_growth = (
+        not all_super_field and official_round >= 4
+        and not _all_markets_near_capacity(conn, round_no, markets, threshold=0.95)
+    )
     ranked = all_rows(conn,
         "SELECT c.id FROM companies c LEFT JOIN results r ON r.company_id=c.id "
         "AND r.round_no=(SELECT MAX(round_no) FROM results WHERE round_no>=1 AND round_no<?) "
@@ -1271,7 +1279,7 @@ def _rebalance_super_bot_production(
     # best-response search against the now complete field BEFORE reducing its
     # production. It can buy more CPI, focus MI or undercut rather than simply
     # surrendering market to the last Bot in the analysis order.
-    for _ in range(2):
+    for attempt in range(2):
         live = _forecast_submitted_market(conn, round_no, markets)["companies"]
         squeezed = [
             int(row["id"]) for row in all_rows(
@@ -1282,6 +1290,24 @@ def _rebalance_super_bot_production(
             and float(live[int(row["id"])]["sold_total"])
             < float(live[int(row["id"])]["available"]) * 0.90
         ]
+        if explore_growth and attempt == 0:
+            # A sell-out only proves the current draft was too small to
+            # expose its upside. Give the best-funded sell-outs a bounded
+            # second look after synthetic rivals have been replaced.
+            growers = all_rows(
+                conn, "SELECT c.id,c.cash,d.production_volume FROM companies c "
+                "JOIN decisions d ON d.company_id=c.id AND d.round_no=? "
+                "WHERE c.is_super_bot=1 AND d.is_draft=1 "
+                "ORDER BY c.cash/(1.0+d.production_volume) DESC,c.id",
+                (round_no,),
+            )
+            extra = [
+                int(row["id"]) for row in growers
+                if int(row["id"]) not in preserve_ids and int(row["id"]) not in squeezed
+                and float(live.get(int(row["id"]), {}).get("available", 0.0)) > 0.0
+                and float(live[int(row["id"])]["sold_total"]) >= float(live[int(row["id"])]["available"]) * 0.97
+            ]
+            squeezed.extend(extra[:2])
         if not squeezed:
             break
         for company_id in squeezed:
@@ -1518,6 +1544,95 @@ def _rebalance_super_bot_production(
                 "UPDATE decisions SET research_investment=0 WHERE company_id=? AND round_no=?",
                 (company_id, round_no),
             )
+
+    if round_no >= 1 and official_round >= max(1, total_rounds - 1):
+        _recheck_late_disruptor_drafts(conn, round_no, markets, transportation_cost)
+
+
+def _recheck_late_disruptor_drafts(
+    conn: sqlite3.Connection,
+    round_no: int,
+    markets: list[dict[str, Any]],
+    transportation_cost: float,
+) -> None:
+    """Repair clearly unaffordable attacks with the completed field in view."""
+    drafts = all_rows(
+        conn,
+        "SELECT c.id,c.cash,c.debt,c.home_city,m.interest_rate "
+        "FROM decisions d JOIN companies c ON c.id=d.company_id "
+        "JOIN market_config m ON m.city=c.home_city "
+        "WHERE d.round_no=? AND d.is_draft=1 AND c.is_disruptor_bot=1 ORDER BY c.id",
+        (round_no,),
+    )
+    if not drafts:
+        return
+    conn.commit()
+
+    def scores(database: sqlite3.Connection) -> dict[int, tuple[float, int]]:
+        field = _forecast_submitted_market(database, round_no, markets)["companies"]
+        funded = preview_round_operations(database, round_no)
+        values = {}
+        loans = {
+            int(plan["company_id"]): float(plan["loan_change"])
+            for plan in all_rows(database,
+                "SELECT company_id,loan_change FROM decisions WHERE round_no=?", (round_no,))
+        }
+        for row in drafts:
+            company_id = int(row["id"])
+            if company_id not in field:
+                continue
+            state = funded[company_id]
+            units = field[company_id]["sold_units"]
+            proceeds = sum(
+                count * (float(state["city_decisions"][city]["price"])
+                         - (transportation_cost if city != row["home_city"] else 0.0))
+                for city, count in units.items()
+            )
+            loan = loans[company_id]
+            spent = float(row["cash"]) + loan - float(state["cash_pre_sales"])
+            interest = (float(row["debt"]) + loan) * float(row["interest_rate"])
+            values[company_id] = proceeds - spent - interest, sum(units.values())
+        return values
+
+    field = scores(conn)
+    for row in drafts:
+        company_id = int(row["id"])
+        profit, sold = field.get(company_id, (0.0, 0))
+        if profit >= -max(1_000., float(row["cash"]) * 0.02):
+            continue
+        # Reanalysis commits each bot separately. Do that in a private copy
+        # so a worse draft or an interrupted repair never replaces the old one.
+        with closing(sqlite3.connect(":memory:")) as trial:
+            trial.row_factory = sqlite3.Row
+            snapshot = bytearray(conn.serialize())
+            snapshot[18:20] = b"\x01\x01"
+            trial.deserialize(bytes(snapshot))
+            _submit_bots(
+                trial, round_no, True, replace_existing=True, target_ids={company_id},
+                defer_rebalance=True, use_complete_field=True,
+            )
+            next_field = scores(trial)
+            next_profit, next_sold = next_field.get(company_id, (-math.inf, 0))
+            # A small squeeze is expected, but do not convert a competitive
+            # plan to zero shipments to save pennies, or move the same loss
+            # onto a second disruptor without improving the total.
+            previous_loss = sum(min(0.0, outcome[0]) for outcome in field.values())
+            next_loss = sum(min(0.0, outcome[0]) for outcome in next_field.values())
+            if (next_profit <= profit or next_loss < previous_loss
+                    or (next_sold < sold * .75 and next_profit < 0)):
+                continue
+            for table in ("decisions", "city_decisions"):
+                rows = all_rows(trial, f"SELECT * FROM {table} WHERE company_id=? AND round_no=?",
+                                (company_id, round_no))
+                if not rows:
+                    continue
+                columns = ", ".join(rows[0].keys())
+                placeholders = ",".join("?" for _ in rows[0].keys())
+                conn.execute(f"DELETE FROM {table} WHERE company_id=? AND round_no=?", (company_id, round_no))
+                conn.executemany(f"INSERT INTO {table}({columns}) VALUES({placeholders})",
+                                 [tuple(values) for values in rows])
+            field = next_field
+            conn.commit()
 
 
 def _submit_bots(
@@ -2074,7 +2189,7 @@ def _submit_bots(
                 # that has not been analysed yet.  Before that window the
                 # strategic Super group likewise moves without anticipating
                 # hidden disruptors; those disruptors then observe and avoid it.
-                if late_disruptor:
+                if late_disruptor and not use_complete_field:
                     continue
                 other_profile = int(other["bot_profile"] if other["bot_profile"] is not None else other_id) % 7
                 other_style = BOT_STYLES[other_profile]
@@ -3420,6 +3535,79 @@ def _submit_bots(
                     forecast_market_sales(players=list(rival_players.values()), **forecast_args)
                     if super_mode else None
                 )
+                # Use the whole submitted field to find free demand, rather
+                # than treating the previous round's saturation as a quota.
+                # A share already sold by a rival remains contestable.
+                baseline_city_sales = {
+                    market["city"]: sum(
+                        company["sold_units"].get(market["city"], 0)
+                        for company in baseline_forecast["companies"].values()
+                    )
+                    for market in forecast_markets
+                }
+                open_units = sum(
+                    max(0.0, market["market_size"] - baseline_city_sales[market["city"]])
+                    for market in forecast_markets
+                )
+                field_size = sum(market["market_size"] for market in forecast_markets)
+                # Focus the extra expensive searches where the audit found
+                # a real midgame supply opportunity, not in the opening.
+                growth_search = (
+                    official_round >= 4
+                    and (not all_super_field or late_disruptor)
+                    and open_units >= field_size * 0.08
+                )
+                if growth_search or late_disruptor:
+                    # MA/QI-heavy plans are expensive to scale. Also try
+                    # sensible single-pool routes, including a small MA
+                    # entry to access investment secondary sales, and
+                    # route even a well-funded MI bid only where useful.
+                    available_focus = sorted(selected, key=lambda idx: (
+                        -max(0.0, forecast_markets[idx]["market_size"]
+                             - baseline_city_sales[forecast_markets[idx]["city"]]),
+                        -forecast_markets[idx]["market_size"], idx,
+                    ))
+                    focus = tuple(sorted(available_focus[:max(1, min(3, len(available_focus)))]))
+                    quotes = (1.0, .95, .81)
+                    if any(item[2] for item in candidate_city_data):
+                        # At least two affordable undercuts: actual city
+                        # margins will still be checked after redistribution.
+                        center = sorted(previous_prices[idx] / max(1., min(price_max, float(markets[idx]["max_price"])))
+                                        for idx in selected)[len(selected) // 2]
+                        quotes += (min(.95, max(.01, center * .99)),
+                                   min(.88, max(.01, center * .88)))
+                    for ratio in dict.fromkeys(quotes):
+                        for ma, qi, mi, cities in (
+                            (1., 0., 0., ()),
+                            (ma_threshold * 1.08, 0., 0., ()),
+                            (1., 0., 1.15, focus),
+                            (1., 0., 2.2, None),
+                        ):
+                            if mi and (not use_mi or floor_lock_disruptor):
+                                continue
+                            seed = evaluate_candidate(ma, qi, mi, ratio, True, cities)
+                            maximum = int(seed["groups"])
+                            fractions = (
+                                (.20, .35, .55, .80, 1.) if late_disruptor and use_complete_field
+                                else (.45, .75, 1.) if late_disruptor else (.55, 1.)
+                            )
+                            for amount in sorted({max(1, round(maximum * part)) for part in fractions} if maximum else {0}):
+                                row = {**seed, "groups": amount, "lean_secondary_route": not late_disruptor}
+                                if late_disruptor:
+                                    row["uniform_late_price"] = True
+                                shortlisted[id(row)] = row
+                    if late_disruptor:
+                        # Keep the floor-lock route available at supply sizes
+                        # spanning competing disruptors and existing stock.
+                        for row in list(shortlisted.values()):
+                            if not row.get("uniform_late_price") or row.get("marketing_total", 0.0):
+                                continue
+                            max_groups = int(row["groups"])
+                            if max_groups <= 1:
+                                continue
+                            for part in (.55, .8):
+                                probe = {**row, "groups": max(1, round(max_groups * part))}
+                                shortlisted[id(probe)] = probe
                 saved_targets = ma_index_target, qi_index_target, marketing_targets
                 rival_player_list = list(rival_players.values())
                 prepared_finalists: list[tuple[
@@ -3678,18 +3866,10 @@ def _submit_bots(
             # still generate different candidate grids and rival responses, but
             # they cannot override the economic result after the search.
             if late_disruptor:
-                disruptor_candidates = finalist_candidates
-                if floor_lock_disruptor:
-                    pure_price_candidates = [
-                        candidate for candidate in finalist_candidates
-                        if float(candidate.get("ma", 0.0)) <= 1.00000001
-                        and float(candidate.get("qi", 0.0)) <= 1.00000001
-                        and float(candidate.get("marketing_total", 0.0)) <= 1e-9
-                    ]
-                    if pure_price_candidates:
-                        disruptor_candidates = pure_price_candidates
+                # Keep the floor-lock plan in the search, but let an
+                # affordable alternative win when the floor cannot pay costs.
                 empirical_candidate = _select_disruptor_attack_candidate(
-                    disruptor_candidates,
+                    finalist_candidates,
                 )
             else:
                 empirical_candidate = _select_empirical_super_candidate(
