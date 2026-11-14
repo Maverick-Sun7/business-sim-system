@@ -28,7 +28,7 @@ from .engine import (
 )
 
 
-BOT_API_VERSION = 39
+BOT_API_VERSION = 40
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 _FORECAST_POOL_LOCK = threading.Lock()
 _FORECAST_POOL: ProcessPoolExecutor | None = None
@@ -477,8 +477,9 @@ def _select_empirical_super_candidate(
     sacrifice_allowed: bool = False,
     contest_market: bool = False,
     expand_at_equal_profit: bool = False,
-    human_benchmark: float | None = None,
+    rival_benchmark: float | None = None,
     race_for_first: bool = False,
+    peer_field: bool = False,
 ) -> dict[str, Any] | None:
     """Choose the plan with the largest relative advantage in the live field.
 
@@ -491,12 +492,16 @@ def _select_empirical_super_candidate(
     valid = [
         candidate for candidate in candidates
         if math.isfinite(float(candidate.get("predicted_profit", -math.inf)))
+        and (not peer_field or not candidate.get("rival_seed") or float(candidate.get("sell_ratio", 0.0)) >= .96)
     ]
     if not valid:
         return None
     if race_for_first:
         contenders = [row for row in valid if "first_place_gap" in row
                       and float(row.get("risk_profit", -math.inf)) >= 0.]
+        if peer_field and contenders:
+            profit_floor = max(float(row["predicted_profit"]) for row in contenders) * .95
+            contenders = [row for row in contenders if float(row["predicted_profit"]) >= profit_floor]
         if contenders:
             # Optimize the actual ranking objective, not this round's profit
             # in isolation. Never take a loss in the stress scenario.
@@ -592,18 +597,18 @@ def _select_empirical_super_candidate(
              * float(candidate.get("price_ratio", 0.0))),
         ),
     )
-    if competitive_mode or (not expand_at_equal_profit and human_benchmark is None):
+    if competitive_mode or (not expand_at_equal_profit and rival_benchmark is None):
         return selected
     # For standard bots use the best ordinary plan's own net profit as the
     # floor. An expanded or imitated plan must make at least as much.
-    ordinary = [row for row in valid if not row.get("human_seed") and not row.get("expansion_probe")]
+    ordinary = [row for row in valid if not row.get("rival_seed") and not row.get("expansion_probe")]
     baseline = max(ordinary or valid, key=lambda row: float(row["predicted_profit"]))
     profit_floor = float(baseline["predicted_profit"])
     eligible = [row for row in valid if float(row["predicted_profit"]) >= profit_floor - 1e-6]
-    if human_benchmark is not None:
+    if rival_benchmark is not None:
         # The rival's selling costs and tax were recalculated for this plan.
         def lead(row):
-            rival = float(row.get("projected_human_profit", human_benchmark))
+            rival = float(row.get("projected_rival_profit", rival_benchmark))
             return float(row["predicted_profit"]) - rival
         # Additional own sales can free secondary capacity that helps the
         # target even more. Apply the profit-gap floor before ranking bids.
@@ -1327,6 +1332,8 @@ def _rebalance_super_bot_production(
         int(row["id"]): str(row["home_city"] or "")
         for row in all_rows(conn, "SELECT id,home_city FROM companies WHERE is_super_bot=1")
     }
+    all_bot_field = not bool(one(conn, "SELECT 1 FROM companies WHERE is_bot=0 LIMIT 1"))
+    contest_round = official_round >= (min(4, total_rounds) if all_bot_field else 4)
     all_super_field = not bool(one(
         conn, "SELECT 1 FROM companies WHERE is_super_bot=0 LIMIT 1",
     ))
@@ -1401,6 +1408,7 @@ def _rebalance_super_bot_production(
 
     if (
         not all_super_field
+        and not (all_bot_field and contest_round)
         and official_round <= max(2, math.ceil(total_rounds * 0.50))
         and not _all_markets_near_capacity(conn, round_no, markets, threshold=0.60)
     ):
@@ -1629,7 +1637,7 @@ def _rebalance_super_bot_production(
 
     if round_no >= 1 and official_round >= max(1, total_rounds - 1):
         _recheck_late_disruptor_drafts(conn, round_no, markets, transportation_cost)
-    if official_round >= 4 and not all_super_field and one(conn, "SELECT 1 FROM companies WHERE is_bot=0"):
+    if round_no > 0 and contest_round:
         _recheck_first_place_draft(conn, round_no)
 
 
@@ -1680,7 +1688,7 @@ def _recheck_first_place_draft(conn: sqlite3.Connection, round_no: int) -> None:
                             "round_no INTEGER,company_id INTEGER,amount REAL)")
             settled.execute("UPDATE decisions SET is_draft=0 WHERE round_no=?", (round_no,))
             settle_round(settled, round_no)
-            return all_rows(settled, "SELECT company_id,net_assets,net_profit,sales_revenue FROM results WHERE round_no=? "
+            return all_rows(settled, "SELECT company_id,net_assets,net_profit,sales_revenue,sold,inventory FROM results WHERE round_no=? "
                             "ORDER BY net_assets DESC,company_id", (round_no,))
 
     def score(rows, company_id):
@@ -1694,22 +1702,59 @@ def _recheck_first_place_draft(conn: sqlite3.Connection, round_no: int) -> None:
                  "WHERE d.company_id=c.id AND d.round_no=? AND d.submitted_at IS NOT NULL)", (round_no,)):
         return
     baseline = exact_results(conn)
-    if not baseline or one(conn, "SELECT 1 FROM companies WHERE id=? AND is_bot=1", (baseline[0]["company_id"],)):
+    if len(baseline) < 2:
         return
     leader_id = int(baseline[0]["company_id"])
-    company_id = int(next(row["company_id"] for row in baseline if row["company_id"] in contenders))
+    human_present = one(conn, "SELECT 1 FROM companies WHERE is_bot=0")
+    if human_present and one(conn, "SELECT 1 FROM companies WHERE id=? AND is_bot=1", (leader_id,)):
+        return
+    company_id = next((int(row["company_id"]) for row in baseline[1:] if row["company_id"] in contenders), None)
+    if company_id is None:
+        return
     old_gap, _ = score(baseline, company_id)
+    final_round = round_no >= get_setting(conn, "total_rounds", 7, int)
+
+    def trailing_asset_ratio(rows):
+        trailing = sorted(float(row["net_assets"]) for row in rows[1:])
+        if len(trailing) < 2:
+            return 1.
+        median = (trailing[(len(trailing) - 1) // 2] + trailing[len(trailing) // 2]) / 2
+        return trailing[0] / max(1., median)
+
+    min_asset_ratio = min(.20, trailing_asset_ratio(baseline))
+    solvent_ids = {row["company_id"] for row in baseline if row["net_assets"] > 0}
+    max_unsold = {
+        row["company_id"]: max(.08, row["inventory"] / max(1, row["sold"] + row["inventory"]))
+        for row in baseline
+    }
+
+    def score_trial(database):
+        rows = exact_results(database)
+        gap, risk = score(rows, company_id)
+        if not human_present:
+            # Let the leader pull away. Check that the teams behind it
+            # stay competitive and that the move does not bankrupt a peer.
+            if trailing_asset_ratio(rows) < min_asset_ratio - 1e-9 or any(
+                row["company_id"] in solvent_ids and row["net_assets"] <= 0 for row in rows
+            ):
+                return gap, -math.inf
+            if final_round and any(
+                row["inventory"] / max(1, row["sold"] + row["inventory"]) > max_unsold[row["company_id"]] + 1e-9
+                for row in rows
+            ):
+                return gap, -math.inf
+        return gap, risk
+
     with _bot_trial_database(conn) as trial:
         _submit_bots(trial, round_no, True, replace_existing=True, target_ids={company_id},
                      defer_rebalance=True, use_complete_field=True, first_place_override=company_id)
-        new_gap, new_risk = score(exact_results(trial), company_id)
+        new_gap, new_risk = score_trial(trial)
         improved = new_gap > old_gap + 1e-6 and new_risk >= 0
-        if round_no >= get_setting(conn, "total_rounds", 7, int):
+        if final_round:
             if not improved:
                 _save_checked_bot_draft(trial, conn, company_id, round_no)
                 new_gap = old_gap
-            new_gap = _refine_final_rank_draft(trial, round_no, company_id, leader_id, new_gap,
-                                              lambda db: score(exact_results(db), company_id))
+            new_gap = _refine_final_rank_draft(trial, round_no, company_id, leader_id, new_gap, score_trial)
             improved = new_gap > old_gap + 1e-6
         if improved:
             _save_checked_bot_draft(conn, trial, company_id, round_no)
@@ -1977,7 +2022,7 @@ def _submit_bots(
         if super_mode else set()
     )
     previous_leader: dict[str, Any] | None = None
-    if super_mode and human_present and official_round > 1:
+    if super_mode and human_present and benchmark_round:
         leader_row = one(
             conn,
             "SELECT r.company_id,r.ma_index,r.qi_index FROM results r "
@@ -2003,14 +2048,12 @@ def _submit_bots(
                 },
             }
 
-    top_standard_ids = set([
-        bot_id for bot_id in ranked_super_ids if bot_id not in disruptor_ids
-    ][:3]) if human_present and super_mode else set()
-    first_place_bot = first_place_override or next((bot_id for bot_id in ranked_super_ids if bot_id in top_standard_ids), None)
-    if first_place_override is not None and human_present:
-        top_standard_ids.add(first_place_override)
-    human_ids = ({int(row["id"]) for row in all_rows(conn, "SELECT id FROM companies WHERE is_bot=0")}
-                 if top_standard_ids else set())
+    standard_ids = [bot_id for bot_id in ranked_super_ids if bot_id not in disruptor_ids]
+    benchmark_bot_ids = set(standard_ids[:3] if human_present else ranked_super_ids) if super_mode else set()
+    first_place_bot = first_place_override or next(iter(standard_ids), None)
+    if first_place_override is not None:
+        benchmark_bot_ids.add(first_place_override)
+    human_ids = {int(row["id"]) for row in all_rows(conn, "SELECT id FROM companies WHERE is_bot=0")} if human_present else set()
     ordinary_seed = "" if super_mode else get_setting(conn, "ordinary_bot_match_seed", "", str)
     playbook_order = _ordinary_playbook_order(ordinary_seed)
     selected_by_bot: dict[int, list[int]] = {}
@@ -2041,7 +2084,7 @@ def _submit_bots(
             if stance == "premium":
                 market_count = max(1, market_count - 1)
         selected_by_bot[int(bot["id"])] = _selected_markets(bot, markets, min(len(markets), market_count))
-        if previous_leader and int(bot["id"]) in top_standard_ids:
+        if previous_leader and int(bot["id"]) in benchmark_bot_ids:
             # Pick up the leader's real prior markets as well as our own home.
             for index, market in enumerate(markets):
                 city = str(market["city"])
@@ -2130,7 +2173,8 @@ def _submit_bots(
             super_mode
             and (late_disruptor or company_id in competitive_super_ids)
         )
-        race_for_first = bool(company_id == first_place_bot and round_no >= 4 and not late_disruptor)
+        contest_start = 4 if human_present else min(4, total_rounds)
+        race_for_first = bool(company_id == first_place_bot and round_no >= contest_start and not late_disruptor)
         profile = int(bot["bot_profile"] if bot["bot_profile"] is not None else company_id) % 7
         normal_mix = _ordinary_mix(playbook_order[bot_position % len(playbook_order)])
         normal_ma, normal_qi, normal_mi, normal_price_stance, normal_pace, normal_mi_start, _ = normal_mix
@@ -2315,15 +2359,23 @@ def _submit_bots(
             # and paid investments, rather than requested numbers, compete for
             # CPI and secondary allocation.
             funded_rivals = preview_round_operations(conn, round_no)
-            if company_id in top_standard_ids and official_round >= 2:
-                live_human_cities = {
-                    city for rival_id in human_ids
+            submitted_rival_ids = {int(row["company_id"]) for row in all_rows(
+                conn, "SELECT company_id FROM decisions WHERE round_no=? AND submitted_at IS NOT NULL AND company_id<>?",
+                (round_no, company_id),
+            )}
+            benchmark_rival_ids = human_ids if human_present else {
+                rival_id for rival_id in submitted_rival_ids
+                if rival_id not in order_position or rival_id in frozen_super_ids
+            }
+            if human_present and company_id in benchmark_bot_ids and official_round >= 2:
+                live_rival_cities = {
+                    city for rival_id in benchmark_rival_ids
                     for city, route in funded_rivals.get(rival_id, {}).get("city_decisions", {}).items()
                     if route["agents_after"] > 0
                 }
                 cash_budget_for_city = max(0., float(bot["cash"]) + loan_change) * .05
                 for index, market in enumerate(markets):
-                    if str(market["city"]) not in live_human_cities or index in selected:
+                    if str(market["city"]) not in live_rival_cities or index in selected:
                         continue
                     delta, current = agent_plan[index]
                     if current <= 0:
@@ -2435,10 +2487,8 @@ def _submit_bots(
                     "available": available_per_city,
                 })
 
-            # Super Bots are analysed and committed one at a time, but every
-            # one sees the same synthetic peers. This keeps a resumed/split run
-            # identical to an uninterrupted batch; the final joint pass uses
-            # the complete real vector.
+            # Forecast unresolved peers in the same way in segmented and
+            # uninterrupted analysis. Saved peers already use their real plans.
             for other_row in bots:
                 other = dict(other_row)
                 other_id = int(other["id"])
@@ -3797,11 +3847,12 @@ def _submit_bots(
                     forecast_market_sales(players=list(rival_players.values()), **forecast_args)
                     if super_mode else None
                 )
-                human_baseline = {}
-                active_humans = human_ids & rival_players.keys() if company_id in top_standard_ids else set()
+                rival_baseline = {}
+                active_benchmarks = (benchmark_rival_ids & rival_players.keys()
+                                     if company_id in benchmark_bot_ids else set())
                 real_rivals = (
-                    (set(funded_rivals) & rival_players.keys()) if race_for_first and use_complete_field
-                    else active_humans
+                    (submitted_rival_ids & rival_players.keys()) if race_for_first and use_complete_field
+                    else active_benchmarks
                 )
                 for rival_id in sorted(real_rivals):
                     actual = funded_rivals[rival_id]
@@ -3815,28 +3866,28 @@ def _submit_bots(
                     fixed = (float(company["cash"]) + float(plan_row["loan_change"]) - float(actual["cash_pre_sales"])
                              + float(plan_row["research_investment"])
                              + (float(company["debt"]) + float(plan_row["loan_change"])) * float(rival_home["interest_rate"]))
-                    human_baseline[rival_id] = (fixed, str(company["home_city"]), float(company["cash"]) - float(company["debt"]), sites)
+                    rival_baseline[rival_id] = (fixed, str(company["home_city"]), float(company["cash"]) - float(company["debt"]), sites)
 
-                def human_profit(rival_id, after):
-                    fixed, rival_home, _, sites = human_baseline[rival_id]
+                def rival_profit(rival_id, after):
+                    fixed, rival_home, _, sites = rival_baseline[rival_id]
                     units = after["companies"][rival_id]["sold_units"]
                     revenue = sum(count * (sites[city]["price"] - (transport_cost if city != rival_home else 0.))
                                   for city, count in units.items() if city in sites)
                     pre_tax = revenue - fixed
                     return pre_tax - max(0., pre_tax * tax_rate)
 
-                projected_human = None
-                eligible_humans = active_humans & human_baseline.keys()
-                if company_id in top_standard_ids and eligible_humans:
-                    projected_human = max(eligible_humans, key=lambda i: (
-                        human_baseline[i][2] + human_profit(i, baseline_forecast), -i))
+                projected_rival = None
+                eligible_benchmarks = active_benchmarks & rival_baseline.keys()
+                if eligible_benchmarks:
+                    projected_rival = max(eligible_benchmarks, key=lambda i: (
+                        rival_baseline[i][2] + rival_profit(i, baseline_forecast), -i))
                     # Copy funded current decisions, plus a previous champion
                     # if its plan differs. Re-budget in our own home/capacity.
-                    human = rival_players[projected_human]
-                    profiles = [human]
+                    benchmark = rival_players[projected_rival]
+                    profiles = [benchmark]
                     if previous_leader:
                         profiles.append({**previous_leader, "ma_index": previous_leader["ma"],
-                                         "qi_index": previous_leader["qi"], "available": human["available"]})
+                                         "qi_index": previous_leader["qi"], "available": benchmark["available"]})
                     for rival in profiles:
                         for investment, quote, volume in (
                             (1., 1., 1.), (.8, 1., 1.), (1., .99, 1.),
@@ -3849,15 +3900,15 @@ def _submit_bots(
                             prices = {city: float(values["price"]) * quote for city, values in rival["cities"].items()}
                             groups = max(0, math.ceil((float(rival["available"]) * volume - old_products) / group["products"]))
                             row = {"ma": ma, "qi": qi, "marketing": marketing, "groups": groups,
-                                   "price_ratio": .95, "human_seed": True, "forecast_prices": prices,
+                                   "price_ratio": .95, "rival_seed": True, "forecast_prices": prices,
                                    "marketing_total": sum(marketing.values())}
                             shortlisted[id(row)] = row
-                    if race_for_first:
+                    if race_for_first and (human_present or use_complete_field):
                         # Compare the two naturally opposing routes: sell
                         # premium into the investment pool or take price CPI
                         # in the cities where the leader actually ships.
                         active = [i for i in selected if agent_plan[i][1] > 0]
-                        leader_routes = human["cities"]
+                        leader_routes = benchmark["cities"]
                         for depth in (0., .02, .06, .13, .24, .38):
                             for ma, qi, mi in ((1., 1., 0.), (ma_threshold * 1.2, 1., 0.),
                                               (ma_threshold * 3, 1., .9), (1., qi_line * 2, 1.4)):
@@ -3879,19 +3930,19 @@ def _submit_bots(
                                     row = {**budget_seed, "marketing": marketing,
                                            "marketing_total": sum(marketing.values()),
                                            "groups": max(0, round(affordable * fraction)),
-                                           "human_seed": True, "forecast_prices": quotes}
+                                           "rival_seed": True, "forecast_prices": quotes}
                                     shortlisted[id(row)] = row
                     # The champion may be funded for many more units than we
                     # can sell at their price. Probe lower-cost openers both
                     # on their best routes and on the cities they leave room in.
-                    human_routes = human["cities"]
+                    benchmark_routes = benchmark["cities"]
                     by_city_capacity = {m["city"]: m["market_size"] for m in forecast_markets}
-                    human_sold = baseline_forecast["companies"][projected_human]["sold_units"]
+                    benchmark_sold = baseline_forecast["companies"][projected_rival]["sold_units"]
                     targets = sorted(
-                        (i for i in selected if str(markets[i]["city"]) in human_routes and agent_plan[i][1] > 0),
+                        (i for i in selected if str(markets[i]["city"]) in benchmark_routes and agent_plan[i][1] > 0),
                         key=lambda i: (
-                            -human_sold.get(str(markets[i]["city"]), 0)
-                             * human_routes[str(markets[i]["city"])]["price"], i),
+                            -benchmark_sold.get(str(markets[i]["city"]), 0)
+                             * benchmark_routes[str(markets[i]["city"])]["price"], i),
                     )
                     focus = targets[:max(1, min(3, len(targets)))]
                     if race_for_first and use_complete_field:
@@ -3911,17 +3962,20 @@ def _submit_bots(
                                     for i in active_routes:
                                         city = str(markets[i]["city"])
                                         cap = min(price_max, float(markets[i]["max_price"]))
-                                        prices[city] = (min(human_routes[city]["price"], previous_prices[i] * .999)
+                                        prices[city] = (min(benchmark_routes[city]["price"], previous_prices[i] * .999)
                                                         * (1. - depth) if i in contested else cap)
                                     for fraction in (.50, .78, 1.):
                                         row = {**seed, "marketing": marketing, "marketing_total": sum(marketing.values()),
                                                "groups": max(0, round(int(seed["groups"]) * fraction)),
-                                               "human_seed": True, "forecast_prices": prices}
+                                               "rival_seed": True, "forecast_prices": prices}
                                         shortlisted[id(row)] = row
-                    for ma, qi, mi_strength in ((1., 0., 0.), (ma_threshold * 1.1, 1., .9),
-                                                (float(human["ma_index"]) * .62, float(human["qi_index"]) * .65, 1.2)):
+                    focus_profiles = ((1., 0., 0.), (ma_threshold * 1.1, 1., .9),
+                                      (float(benchmark["ma_index"]) * .62, float(benchmark["qi_index"]) * .65, 1.2))
+                    if not human_present and not use_complete_field:
+                        focus_profiles = focus_profiles[:1]
+                    for ma, qi, mi_strength in focus_profiles:
                         marketing = {i: max(
-                            human_routes[str(markets[i]["city"])]["marketing"] * .6,
+                            benchmark_routes[str(markets[i]["city"])]["marketing"] * .6,
                             mi_thresholds[i] * mi_strength,
                         ) for i in focus if mi_strength > 0.}
                         seed = evaluate_candidate(ma, qi, 0., .95, True, ())
@@ -3933,7 +3987,7 @@ def _submit_bots(
                                 cap = min(price_max, float(markets[i]["max_price"]))
                                 if i in focus:
                                     prices[city] = min(
-                                        human_routes[city]["price"] * undercut,
+                                        benchmark_routes[city]["price"] * undercut,
                                         previous_prices[i] * .99,
                                     )
                                 else:
@@ -3941,7 +3995,7 @@ def _submit_bots(
                                         .995 if by_city_capacity[city] > sum(by_city_capacity.values()) / len(markets) else .95
                                     )
                             row = {**seed, "marketing": marketing, "groups": max(0, round(groups * fraction)),
-                                   "human_seed": True, "forecast_prices": prices,
+                                   "rival_seed": True, "forecast_prices": prices,
                                    "marketing_total": sum(marketing.values())}
                             shortlisted[id(row)] = row
                 # Use the whole submitted field to find free demand, rather
@@ -4112,7 +4166,7 @@ def _submit_bots(
                         }
                     # Preserve prices of plans with different quotes by city.
                     # Plain ratio-based candidates are rebuilt at save time.
-                    if late_disruptor or candidate.get("human_seed") or candidate.get("expansion_probe"):
+                    if late_disruptor or candidate.get("rival_seed") or candidate.get("expansion_probe"):
                         candidate["resolved_city_prices"] = {
                             city: float(data["price"])
                             for city, data in own_cities.items()
@@ -4175,11 +4229,11 @@ def _submit_bots(
                     if baseline_forecast is not None:
                         candidate.update(_super_target_pressure(
                             baseline_forecast, after_forecast, rival_player_list))
-                    if projected_human is not None:
-                        candidate["projected_human_profit"] = human_profit(projected_human, after_forecast)
-                    if race_for_first and human_baseline:
+                    if projected_rival is not None:
+                        candidate["projected_rival_profit"] = rival_profit(projected_rival, after_forecast)
+                    if race_for_first and rival_baseline:
                         candidate["first_place_gap"] = own_strategy_assets + candidate["predicted_profit"] - max(
-                            human_baseline[i][2] + human_profit(i, after_forecast) for i in human_baseline
+                            rival_baseline[i][2] + rival_profit(i, after_forecast) for i in rival_baseline
                         )
                     verified_candidates.append(candidate)
 
@@ -4345,9 +4399,10 @@ def _submit_bots(
                     competitive_mode=competitive_mode,
                     contest_market=True,
                     expand_at_equal_profit=bool(expand_late) if finalist_candidates else False,
-                    human_benchmark=(human_profit(projected_human, baseline_forecast)
-                                     if finalist_candidates and projected_human is not None else None),
+                    rival_benchmark=(rival_profit(projected_rival, baseline_forecast)
+                                     if finalist_candidates and projected_rival is not None else None),
                     race_for_first=race_for_first,
+                    peer_field=not human_present,
                     sacrifice_allowed=bool(
                         last_round
                         and competitive_mode

@@ -44,7 +44,7 @@ if (
     or not hasattr(_db_module, "prepare_first_round_after_test")
     or getattr(_cpi_module, "CPI_API_VERSION", 0) < 6
     or getattr(_engine_module, "ENGINE_API_VERSION", 0) < 14
-    or getattr(_bots_module, "BOT_API_VERSION", 0) < 39
+    or getattr(_bots_module, "BOT_API_VERSION", 0) < 40
     or getattr(_ai_training_module, "AI_TRAINING_API_VERSION", 0) < 1
 ):
     importlib.invalidate_caches()

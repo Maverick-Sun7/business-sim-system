@@ -196,12 +196,12 @@ class BotKDSRegressionTest(unittest.TestCase):
         self.assertIs(chosen, wider)
 
     def test_super_drops_a_human_counter_that_improves_the_rival_even_more(self):
-        ordinary = dict(predicted_profit=100., predicted_sold=100., projected_human_profit=200.)
-        copied = dict(predicted_profit=120., predicted_sold=150., projected_human_profit=240., human_seed=True)
-        counter = dict(predicted_profit=121., predicted_sold=155., projected_human_profit=180., human_seed=True)
+        ordinary = dict(predicted_profit=100., predicted_sold=100., projected_rival_profit=200.)
+        copied = dict(predicted_profit=120., predicted_sold=150., projected_rival_profit=240., rival_seed=True)
+        counter = dict(predicted_profit=121., predicted_sold=155., projected_rival_profit=180., rival_seed=True)
         for plans, expected in (([ordinary, copied], ordinary), ([ordinary, copied, counter], counter)):
             chosen = self.bots._select_empirical_super_candidate(
-                plans, 0, tactical_price_allowed=True, human_benchmark=200.,
+                plans, 0, tactical_price_allowed=True, rival_benchmark=200.,
             )
             self.assertIs(chosen, expected)
 
@@ -267,6 +267,55 @@ class BotKDSRegressionTest(unittest.TestCase):
         for company_id in supers[:3]:
             self.assertIn(24671, seen[company_id])
         self.assertNotIn(24671, seen[supers[3]])
+
+    def test_bot_only_analysis_uses_earlier_saved_peer_as_a_live_benchmark(self):
+        first = self.company("FIRST", super_mode=True, cash=30_000_000)
+        second = self.company("SECOND", super_mode=True, cash=30_000_000)
+        later = self.company("LATER", super_mode=True, cash=30_000_000)
+        self.conn.execute("DELETE FROM market_config WHERE city<>'广州'")
+        self.conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+        self.conn.executemany("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)",
+                              [(first,), (second,), (later,)])
+        self.conn.execute("UPDATE companies SET product_inventory=100 WHERE id IN (?,?)", (first, later))
+        for company_id, price in ((first, 24671), (later, 23417)):
+            self.conn.execute(
+                "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,management_investment,"
+                "submitted_at,is_draft) VALUES(?,1,3300,6400,1500,?,1)",
+                (company_id, self.db.now_iso()),
+            )
+            self.conn.execute("INSERT INTO city_decisions(company_id,round_no,city,price) VALUES(?,1,'广州',?)",
+                              (company_id, price))
+        original = self.bots._forecast_candidates
+        seen = set()
+
+        def capture(payloads):
+            for item in payloads:
+                seen.update(route["price"] for route in item["players"][-1]["cities"].values())
+            return original(payloads)
+
+        with patch.object(self.bots, "_forecast_candidates", side_effect=capture):
+            self.assertEqual(self.bots.submit_super_bot_decisions(
+                self.conn, 1, replace_existing=True, target_ids={second}, defer_rebalance=True,
+            ), 1)
+        self.assertIn(24671, seen)
+        self.assertNotIn(23417, seen)
+        self.assertEqual(self.db.one(self.conn, "SELECT price FROM city_decisions WHERE company_id=?",
+                                    (first,))["price"], 24671)
+
+    def test_bot_only_rebalance_checks_the_challenger_against_the_bot_leader(self):
+        leader = self.company("LEADER", cash=50_000_000, super_mode=True)
+        challenger = self.company("CHALLENGER", cash=20_000_000, super_mode=True)
+        self.db.set_setting(self.conn, "total_rounds", 3)
+        self.conn.execute("INSERT INTO rounds(round_no,status) VALUES(3,'open')")
+        for company_id in (leader, challenger):
+            self.conn.execute(
+                "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,submitted_at,is_draft) "
+                "VALUES(?,3,3300,6400,?,1)", (company_id, self.db.now_iso()),
+            )
+        with patch.object(self.bots, "_submit_bots") as submit:
+            self.assertEqual(self.bots.rebalance_super_bot_decisions(self.conn, 3), 2)
+        self.assertEqual(submit.call_args.kwargs["target_ids"], {challenger})
+        self.assertIsNone(self.db.one(self.conn, "SELECT 1 FROM results WHERE round_no=3"))
 
     def test_competitive_super_bot_count_is_ranked_and_bounded(self):
         ranked = list(range(1, 10))
