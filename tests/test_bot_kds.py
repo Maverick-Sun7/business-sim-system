@@ -174,6 +174,100 @@ class BotKDSRegressionTest(unittest.TestCase):
         self.assertGreater(sum(item["secondary_units"] for item in report["sales"]), result["sold"] * 0.50)
         self.assertGreaterEqual(report["sales"][0]["price"], 24750)
 
+    def test_patent_budget_uses_remaining_rounds_accumulated_research_and_cash(self):
+        plan = dict(balance=3_000_000, remaining_rounds=2, material_spend=80_000_000,
+                    sold=9000, available=10000, projected_cash=35_000_000,
+                    reserve=15_000_000, risk_profit=12_000_000, amount_25=1_500_000,
+                    amount_75=6_000_000, hidden_cap=.43, hidden_multiplier=4/3,
+                    buffer=150_000, patent_factor=.7, tax_rate=.2)
+        invest = self.bots._profitable_patent_budget
+        self.assertEqual(invest(**plan), 5_150_000)
+        self.assertEqual(invest(**{**plan, "remaining_rounds": 0}), 0)
+        self.assertEqual(invest(**{**plan, "material_spend": 500_000}), 0)
+        self.assertEqual(invest(**{**plan, "projected_cash": 16_000_000}), 0)
+
+    def test_super_expansion_never_goes_below_the_unexpanded_profit(self):
+        normal = dict(predicted_profit=100., predicted_sold=100., sell_ratio=1.)
+        wider = dict(predicted_profit=100., predicted_sold=130., sell_ratio=.97, expansion_probe=True)
+        loss = dict(predicted_profit=99., predicted_sold=180., sell_ratio=1., expansion_probe=True)
+        chosen = self.bots._select_empirical_super_candidate(
+            [normal, wider, loss], 0, tactical_price_allowed=True, expand_at_equal_profit=True,
+        )
+        self.assertIs(chosen, wider)
+
+    def test_super_drops_a_human_counter_that_improves_the_rival_even_more(self):
+        ordinary = dict(predicted_profit=100., predicted_sold=100., projected_human_profit=200.)
+        copied = dict(predicted_profit=120., predicted_sold=150., projected_human_profit=240., human_seed=True)
+        counter = dict(predicted_profit=121., predicted_sold=155., projected_human_profit=180., human_seed=True)
+        for plans, expected in (([ordinary, copied], ordinary), ([ordinary, copied, counter], counter)):
+            chosen = self.bots._select_empirical_super_candidate(
+                plans, 0, tactical_price_allowed=True, human_benchmark=200.,
+            )
+            self.assertIs(chosen, expected)
+
+    def test_first_place_bot_prioritizes_the_final_gap_without_taking_a_stress_loss(self):
+        high_profit = dict(predicted_profit=180., predicted_sold=150., risk_profit=130., first_place_gap=-120.)
+        closer = dict(predicted_profit=100., predicted_sold=125., risk_profit=70., first_place_gap=-15.)
+        speculative_win = dict(predicted_profit=200., predicted_sold=155., risk_profit=-1., first_place_gap=80.)
+        chosen = self.bots._select_empirical_super_candidate(
+            [high_profit, closer, speculative_win], 0, tactical_price_allowed=True, race_for_first=True,
+        )
+        self.assertIs(chosen, closer)
+
+    def test_first_place_recheck_keeps_the_round_open_on_a_worker_snapshot(self):
+        import json
+        import sqlite3
+        from contextlib import closing
+        from sim.remote_worker import _snapshot, load_snapshot
+
+        human = self.company("HUMAN", cash=50_000_000)
+        contender = self.company("CONTENDER", cash=20_000_000, super_mode=True)
+        trailing = self.company("TRAILING", cash=10_000_000, super_mode=True)
+        self.conn.execute("INSERT INTO rounds(round_no,status) VALUES(4,'open')")
+        for company_id in (human, contender, trailing):
+            self.conn.execute(
+                "INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,submitted_at,is_draft) "
+                "VALUES(?,4,3300,6400,?,?)", (company_id, self.db.now_iso(), int(company_id != human)),
+            )
+        raw, _ = _snapshot(self.conn)
+        with closing(sqlite3.connect(":memory:")) as worker:
+            worker.row_factory = sqlite3.Row
+            load_snapshot(worker, json.loads(raw))
+            with patch.object(self.bots, "_submit_bots") as submit:
+                self.bots._recheck_first_place_draft(worker, 4)
+            self.assertEqual(submit.call_args.kwargs["target_ids"], {contender})
+            self.assertIsNone(self.db.one(worker, "SELECT 1 FROM results WHERE round_no=4"))
+            self.assertEqual(self.db.one(worker, "SELECT status FROM rounds WHERE round_no=4")["status"], "open")
+            self.assertEqual(self.db.one(worker, "SELECT SUM(is_draft) AS n FROM decisions WHERE round_no=4")["n"], 2)
+
+    def test_top_three_copy_current_human_prices_even_with_no_prior_reports(self):
+        humans = [self.company("HUMAN-A"), self.company("HUMAN-B")]
+        supers = [self.company(f"SUPER-{i}", super_mode=True, cash=30_000_000) for i in range(4)]
+        self.conn.execute("DELETE FROM market_config WHERE city<>'广州'")
+        self.conn.execute("UPDATE rounds SET status='open' WHERE round_no=1")
+        for company_id in humans + supers:
+            self.conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (company_id,))
+        for i, company_id in enumerate(humans):
+            self.conn.execute("UPDATE companies SET product_inventory=100 WHERE id=?", (company_id,))
+            self.conn.execute("INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,"
+                              "management_investment,submitted_at) VALUES(?,1,3300,6400,?,?)",
+                              (company_id, (i+1)*1500, self.db.now_iso()))
+            self.conn.execute("INSERT INTO city_decisions(company_id,round_no,city,price) VALUES(?,1,'广州',?)",
+                              (company_id, 10000 if i==0 else 24671))
+        seen = {}
+        original = self.bots._forecast_candidates
+        def capture(payloads):
+            for item in payloads:
+                player = item["players"][-1]
+                own_prices = seen.setdefault(player["company_id"], set())
+                own_prices.update(route["price"] for route in player["cities"].values())
+            return original(payloads)
+        with patch.object(self.bots, "_forecast_candidates", side_effect=capture):
+            self.assertEqual(self.bots.submit_super_bot_decisions(self.conn, 1, defer_rebalance=True), 4)
+        for company_id in supers[:3]:
+            self.assertIn(24671, seen[company_id])
+        self.assertNotIn(24671, seen[supers[3]])
+
     def test_competitive_super_bot_count_is_ranked_and_bounded(self):
         ranked = list(range(1, 10))
         # Penultimate/final rounds use one third, always taken from the lowest

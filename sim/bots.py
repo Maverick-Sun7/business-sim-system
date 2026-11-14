@@ -8,7 +8,7 @@ import random
 import sqlite3
 import threading
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
 from typing import Any, Callable
 
 from .bot_joint_pricing import JointPriceTarget, solve_joint_prices
@@ -22,10 +22,13 @@ from .cpi import (
     prepare_investment_average_prices,
 )
 from .db import all_rows, effective_employee_count, employee_count, get_setting, now_iso, one
-from .engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, preview_round_operations
+from .engine import (
+    available_loan_limit, current_company_net_assets, effective_research_probability,
+    loan_ceiling_for_round, preview_round_operations,
+)
 
 
-BOT_API_VERSION = 37
+BOT_API_VERSION = 39
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 _FORECAST_POOL_LOCK = threading.Lock()
 _FORECAST_POOL: ProcessPoolExecutor | None = None
@@ -473,6 +476,9 @@ def _select_empirical_super_candidate(
     competitive_mode: bool = False,
     sacrifice_allowed: bool = False,
     contest_market: bool = False,
+    expand_at_equal_profit: bool = False,
+    human_benchmark: float | None = None,
+    race_for_first: bool = False,
 ) -> dict[str, Any] | None:
     """Choose the plan with the largest relative advantage in the live field.
 
@@ -488,6 +494,16 @@ def _select_empirical_super_candidate(
     ]
     if not valid:
         return None
+    if race_for_first:
+        contenders = [row for row in valid if "first_place_gap" in row
+                      and float(row.get("risk_profit", -math.inf)) >= 0.]
+        if contenders:
+            # Optimize the actual ranking objective, not this round's profit
+            # in isolation. Never take a loss in the stress scenario.
+            return max(contenders, key=lambda row: (
+                float(row["first_place_gap"]), float(row["predicted_profit"]),
+                float(row["predicted_sold"]),
+            ))
     if not sacrifice_allowed:
         # Saturation and penultimate-round attackers must first look for a
         # profitable way to apply pressure. Deliberate capital sacrifice is
@@ -553,7 +569,7 @@ def _select_empirical_super_candidate(
             return profit
         return profit + min(best_profit * 0.15, max(0.0, float(candidate.get("targeted_damage", 0.0))) * 0.20)
 
-    return max(
+    selected = max(
         valid,
         key=lambda candidate: (
             strategic_value(candidate) if competitive_mode else contest_value(candidate),
@@ -576,6 +592,72 @@ def _select_empirical_super_candidate(
              * float(candidate.get("price_ratio", 0.0))),
         ),
     )
+    if competitive_mode or (not expand_at_equal_profit and human_benchmark is None):
+        return selected
+    # For standard bots use the best ordinary plan's own net profit as the
+    # floor. An expanded or imitated plan must make at least as much.
+    ordinary = [row for row in valid if not row.get("human_seed") and not row.get("expansion_probe")]
+    baseline = max(ordinary or valid, key=lambda row: float(row["predicted_profit"]))
+    profit_floor = float(baseline["predicted_profit"])
+    eligible = [row for row in valid if float(row["predicted_profit"]) >= profit_floor - 1e-6]
+    if human_benchmark is not None:
+        # The rival's selling costs and tax were recalculated for this plan.
+        def lead(row):
+            rival = float(row.get("projected_human_profit", human_benchmark))
+            return float(row["predicted_profit"]) - rival
+        # Additional own sales can free secondary capacity that helps the
+        # target even more. Apply the profit-gap floor before ranking bids.
+        counters = [row for row in eligible if lead(row) >= lead(baseline) - 1e-6]
+        best_profit = max(float(row["predicted_profit"]) for row in counters)
+        if best_profit > 0:
+            return max((row for row in counters if float(row["predicted_profit"]) >= best_profit * .995),
+                       key=lambda row: (lead(row), float(row["predicted_sold"]), float(row["predicted_profit"])))
+    if expand_at_equal_profit and profit_floor > 0:
+        # Only exchange a negligible part of the newly found upside for
+        # materially more sellable stock; never go below the old plan.
+        best = max(eligible, key=lambda row: float(row["predicted_profit"]))
+        upside = float(best["predicted_profit"]) - profit_floor
+        return max((row for row in eligible if float(row["predicted_profit"]) >= profit_floor + upside * .98
+                    and float(row.get("sell_ratio", 0.0)) >= .90),
+                   key=lambda row: (float(row["predicted_sold"]), float(row["predicted_profit"])),
+                   default=best)
+    return selected
+
+
+def _profitable_patent_budget(
+    *, balance: float, remaining_rounds: int, material_spend: float, sold: float,
+    available: int, projected_cash: float, reserve: float, risk_profit: float,
+    amount_25: float, amount_75: float, hidden_cap: float, hidden_multiplier: float,
+    buffer: float, patent_factor: float, tax_rate: float,
+) -> float:
+    """Buy only funded R&D whose expected future material savings pay back."""
+    if remaining_rounds <= 0 or sold <= 0 or material_spend <= 0 or patent_factor >= 1:
+        return 0.0
+    minimum = max(0., amount_75 * hidden_multiplier + buffer)
+    high = max(minimum, amount_75 * 2.)
+    base_probability = effective_research_probability(
+        balance, amount_25, amount_75, hidden_cap, hidden_multiplier)
+    # Use current material prices (already discounted by active patents).
+    # Only sold volume supports the projection; discount later rounds and
+    # limit projected growth to two steps so one sellout cannot fund a gamble.
+    throughput = min(1., sold / max(1., available))
+    growth = 1.45 if throughput >= .92 and remaining_rounds >= 3 else 1.
+    horizon = sum(growth ** min(step, 2) / 1.12 ** step for step in range(1, remaining_rounds+1))
+    saving = material_spend * throughput * (1. - patent_factor) * horizon
+    best_budget, best_gain = 0., 0.
+    for total in sorted({minimum, high} if projected_cash >= high * 5 else {minimum}):
+        spend = max(0., total - balance)
+        if spend <= 0 or projected_cash - spend < reserve or risk_profit < spend * .65:
+            continue
+        probability = effective_research_probability(
+            total, amount_25, amount_75, hidden_cap, hidden_multiplier)
+        if total < amount_75 * hidden_multiplier or probability <= 0:
+            continue
+        gain = ((probability - base_probability) * saving * (1.-tax_rate)
+                - spend * (1.-tax_rate))
+        if gain > best_gain:
+            best_budget, best_gain = spend, gain
+    return best_budget
 
 
 def _competitive_super_attackers(
@@ -1547,6 +1629,161 @@ def _rebalance_super_bot_production(
 
     if round_no >= 1 and official_round >= max(1, total_rounds - 1):
         _recheck_late_disruptor_drafts(conn, round_no, markets, transportation_cost)
+    if official_round >= 4 and not all_super_field and one(conn, "SELECT 1 FROM companies WHERE is_bot=0"):
+        _recheck_first_place_draft(conn, round_no)
+
+
+@contextmanager
+def _bot_trial_database(conn: sqlite3.Connection):
+    # Read the current transaction, without carrying over its WAL header or
+    # committing a speculative Bot onto the authoritative database.
+    snapshot = bytearray(conn.serialize())
+    snapshot[18:20] = b"\x01\x01"
+    with closing(sqlite3.connect(":memory:")) as trial:
+        trial.row_factory = sqlite3.Row
+        trial.deserialize(bytes(snapshot))
+        yield trial
+
+
+def _save_checked_bot_draft(conn: sqlite3.Connection, trial: sqlite3.Connection,
+                            company_id: int, round_no: int) -> None:
+    for table in ("decisions", "city_decisions"):
+        rows = all_rows(trial, f"SELECT * FROM {table} WHERE company_id=? AND round_no=?",
+                        (company_id, round_no))
+        if not rows:
+            continue
+        columns = ", ".join(rows[0].keys())
+        placeholders = ",".join("?" for _ in rows[0].keys())
+        conn.execute(f"DELETE FROM {table} WHERE company_id=? AND round_no=?", (company_id, round_no))
+        conn.executemany(f"INSERT INTO {table}({columns}) VALUES({placeholders})",
+                         [tuple(values) for values in rows])
+
+
+def _recheck_first_place_draft(conn: sqlite3.Connection, round_no: int) -> None:
+    """Rerun just one contender against all saved drafts and check exact rank."""
+    if one(conn, "SELECT 1 FROM results WHERE round_no=?", (round_no,)):
+        return
+    contenders = {row["id"] for row in all_rows(conn,
+        "SELECT c.id FROM companies c JOIN decisions d ON d.company_id=c.id AND d.round_no=? "
+        "WHERE c.is_bot=1 AND c.is_super_bot=1 AND c.is_disruptor_bot=0 AND d.is_draft=1", (round_no,))}
+    if not contenders:
+        return
+    from .engine import settle_round
+
+    def exact_results(database):
+        with _bot_trial_database(database) as settled:
+            # Worker snapshots deliberately omit rollback snapshots and bonus
+            # records; opening cash already includes the credited bonus.
+            settled.execute("CREATE TABLE IF NOT EXISTS round_snapshots("
+                            "round_no INTEGER PRIMARY KEY,snapshot_json TEXT,created_at TEXT)")
+            settled.execute("CREATE TABLE IF NOT EXISTS round_bonuses("
+                            "round_no INTEGER,company_id INTEGER,amount REAL)")
+            settled.execute("UPDATE decisions SET is_draft=0 WHERE round_no=?", (round_no,))
+            settle_round(settled, round_no)
+            return all_rows(settled, "SELECT company_id,net_assets,net_profit,sales_revenue FROM results WHERE round_no=? "
+                            "ORDER BY net_assets DESC,company_id", (round_no,))
+
+    def score(rows, company_id):
+        own = next(row for row in rows if row["company_id"] == company_id)
+        gap = float(own["net_assets"]) - max(float(row["net_assets"]) for row in rows
+                                            if row["company_id"] != company_id)
+        return gap, float(own["net_profit"]) - .08 * float(own["sales_revenue"])
+
+    # Any absent drafts imply this is a partial local job, not a full field.
+    if one(conn, "SELECT 1 FROM companies c WHERE NOT EXISTS (SELECT 1 FROM decisions d "
+                 "WHERE d.company_id=c.id AND d.round_no=? AND d.submitted_at IS NOT NULL)", (round_no,)):
+        return
+    baseline = exact_results(conn)
+    if not baseline or one(conn, "SELECT 1 FROM companies WHERE id=? AND is_bot=1", (baseline[0]["company_id"],)):
+        return
+    leader_id = int(baseline[0]["company_id"])
+    company_id = int(next(row["company_id"] for row in baseline if row["company_id"] in contenders))
+    old_gap, _ = score(baseline, company_id)
+    with _bot_trial_database(conn) as trial:
+        _submit_bots(trial, round_no, True, replace_existing=True, target_ids={company_id},
+                     defer_rebalance=True, use_complete_field=True, first_place_override=company_id)
+        new_gap, new_risk = score(exact_results(trial), company_id)
+        improved = new_gap > old_gap + 1e-6 and new_risk >= 0
+        if round_no >= get_setting(conn, "total_rounds", 7, int):
+            if not improved:
+                _save_checked_bot_draft(trial, conn, company_id, round_no)
+                new_gap = old_gap
+            new_gap = _refine_final_rank_draft(trial, round_no, company_id, leader_id, new_gap,
+                                              lambda db: score(exact_results(db), company_id))
+            improved = new_gap > old_gap + 1e-6
+        if improved:
+            _save_checked_bot_draft(conn, trial, company_id, round_no)
+            conn.commit()
+
+
+def _refine_final_rank_draft(
+    trial: sqlite3.Connection, round_no: int, company_id: int, leader_id: int,
+    best_gap: float, evaluate: Callable[[sqlite3.Connection], tuple[float, float]],
+) -> float:
+    """Search a bounded neighborhood of the final draft using actual settlement."""
+    key = (round_no, company_id)
+    price_min = max(0., get_setting(trial, "price_min", 3500.))
+    global_cap = get_setting(trial, "price_max", 25000.)
+    growth = get_setting(trial, "market_growth", 1.10) ** max(0, round_no - 1)
+    routes = all_rows(trial,
+        "SELECT d.city,m.max_price,l.price AS opponent_price, "
+        "COALESCE(h.count,0)+COALESCE(l.agent_delta,0) AS opponent_agents, "
+        "COALESCE(a.count,0)+d.agent_delta AS own_agents, "
+        "m.population*m.penetration AS market_size "
+        "FROM city_decisions d JOIN market_config m ON m.city=d.city "
+        "LEFT JOIN city_decisions l ON l.round_no=d.round_no AND l.city=d.city AND l.company_id=? "
+        "LEFT JOIN agents a ON a.city=d.city AND a.company_id=d.company_id "
+        "LEFT JOIN agents h ON h.city=d.city AND h.company_id=l.company_id "
+        "WHERE d.round_no=? AND d.company_id=? AND COALESCE(a.count,0)+d.agent_delta>0 "
+        "ORDER BY opponent_agents>0 DESC,market_size DESC,d.city LIMIT 6", (leader_id, *key))
+
+    def consider(sql, params):
+        nonlocal best_gap
+        trial.execute("SAVEPOINT rank_probe")
+        try:
+            trial.execute(sql, params)
+            gap, risk = evaluate(trial)
+            if gap > best_gap + 1e-6 and risk >= 0:
+                best_gap = gap
+            else:
+                trial.execute("ROLLBACK TO rank_probe")
+        except BaseException:
+            trial.execute("ROLLBACK TO rank_probe")
+            raise
+        finally:
+            trial.execute("RELEASE rank_probe")
+
+    if not routes:
+        return best_gap
+    # Exact thresholds and payroll can make score rankings move after the
+    # forecast. Changing one route at a time keeps improvements already found.
+    starting_bid = one(trial, "SELECT management_investment,quality_investment FROM decisions "
+                       "WHERE round_no=? AND company_id=?", key)
+    for ma_scale, qi_scale in ((.5, .5), (1.5, 1.), (1., 1.75), (.25, 1.), (1., .25)):
+        consider("UPDATE decisions SET management_investment=?,quality_investment=? "
+                 "WHERE round_no=? AND company_id=?",
+                 (starting_bid["management_investment"] * ma_scale,
+                  starting_bid["quality_investment"] * qi_scale, *key))
+    for route in routes:
+        city = route["city"]
+        old = one(trial, "SELECT price,marketing_investment FROM city_decisions "
+                  "WHERE round_no=? AND company_id=? AND city=?", (*key, city))
+        cap = min(global_cap, float(route["max_price"]))
+        price = float(old["price"])
+        anchor = float(route["opponent_price"] or price) if route["opponent_agents"] > 0 else price
+        quotes = dict.fromkeys(min(cap, max(price_min, bid)) for bid in
+                               (cap, price * .97, price * .86, anchor - 1., anchor * .91))
+        for quote in quotes:
+            if abs(quote - price) > 1e-6:
+                consider("UPDATE city_decisions SET price=? WHERE round_no=? AND company_id=? AND city=?",
+                         (quote, *key, city))
+        threshold = float(route["max_price"]) / 50 * route["market_size"] * growth * .20
+        threshold /= 3 * (1 + route["own_agents"] * .10)
+        for bid in dict.fromkeys((0., max(float(old["marketing_investment"]) * 2., threshold * 2.))):
+            if abs(bid - float(old["marketing_investment"])) > 1e-6:
+                consider("UPDATE city_decisions SET marketing_investment=? "
+                         "WHERE round_no=? AND company_id=? AND city=?", (bid, *key, city))
+    return best_gap
 
 
 def _recheck_late_disruptor_drafts(
@@ -1602,11 +1839,7 @@ def _recheck_late_disruptor_drafts(
             continue
         # Reanalysis commits each bot separately. Do that in a private copy
         # so a worse draft or an interrupted repair never replaces the old one.
-        with closing(sqlite3.connect(":memory:")) as trial:
-            trial.row_factory = sqlite3.Row
-            snapshot = bytearray(conn.serialize())
-            snapshot[18:20] = b"\x01\x01"
-            trial.deserialize(bytes(snapshot))
+        with _bot_trial_database(conn) as trial:
             _submit_bots(
                 trial, round_no, True, replace_existing=True, target_ids={company_id},
                 defer_rebalance=True, use_complete_field=True,
@@ -1621,16 +1854,7 @@ def _recheck_late_disruptor_drafts(
             if (next_profit <= profit or next_loss < previous_loss
                     or (next_sold < sold * .75 and next_profit < 0)):
                 continue
-            for table in ("decisions", "city_decisions"):
-                rows = all_rows(trial, f"SELECT * FROM {table} WHERE company_id=? AND round_no=?",
-                                (company_id, round_no))
-                if not rows:
-                    continue
-                columns = ", ".join(rows[0].keys())
-                placeholders = ",".join("?" for _ in rows[0].keys())
-                conn.execute(f"DELETE FROM {table} WHERE company_id=? AND round_no=?", (company_id, round_no))
-                conn.executemany(f"INSERT INTO {table}({columns}) VALUES({placeholders})",
-                                 [tuple(values) for values in rows])
+            _save_checked_bot_draft(conn, trial, company_id, round_no)
             field = next_field
             conn.commit()
 
@@ -1645,6 +1869,7 @@ def _submit_bots(
     target_ids: set[int] | None = None,
     defer_rebalance: bool = False,
     use_complete_field: bool = False,
+    first_place_override: int | None = None,
 ) -> int:
     bots = all_rows(
         conn,
@@ -1756,8 +1981,9 @@ def _submit_bots(
         leader_row = one(
             conn,
             "SELECT r.company_id,r.ma_index,r.qi_index FROM results r "
-            "WHERE r.round_no=? ORDER BY r.net_assets DESC,r.company_id LIMIT 1",
-            (official_round - 1,),
+            "JOIN companies c ON c.id=r.company_id "
+            "WHERE r.round_no=? AND c.is_bot=0 ORDER BY r.net_assets DESC,r.company_id LIMIT 1",
+            (benchmark_round,),
         )
         if leader_row:
             previous_leader = {
@@ -1765,18 +1991,26 @@ def _submit_bots(
                 "qi": float(leader_row["qi_index"] or 0),
                 "cities": {
                     str(row["city"]): {
-                        "marketing": float(row["marketing_investment"] or 0),
+                        "marketing": float(row["marketing"] or 0),
                         "price": float(row["price"] or 0),
                     }
                     for row in all_rows(
                         conn,
-                        "SELECT city,marketing_investment,price FROM city_decisions "
-                        "WHERE company_id=? AND round_no=?",
-                        (leader_row["company_id"], official_round - 1),
+                        "SELECT city,marketing,price FROM city_results "
+                        "WHERE company_id=? AND round_no=? AND (cpi>0 OR sold>0 OR marketing>0)",
+                        (leader_row["company_id"], benchmark_round),
                     )
                 },
             }
 
+    top_standard_ids = set([
+        bot_id for bot_id in ranked_super_ids if bot_id not in disruptor_ids
+    ][:3]) if human_present and super_mode else set()
+    first_place_bot = first_place_override or next((bot_id for bot_id in ranked_super_ids if bot_id in top_standard_ids), None)
+    if first_place_override is not None and human_present:
+        top_standard_ids.add(first_place_override)
+    human_ids = ({int(row["id"]) for row in all_rows(conn, "SELECT id FROM companies WHERE is_bot=0")}
+                 if top_standard_ids else set())
     ordinary_seed = "" if super_mode else get_setting(conn, "ordinary_bot_match_seed", "", str)
     playbook_order = _ordinary_playbook_order(ordinary_seed)
     selected_by_bot: dict[int, list[int]] = {}
@@ -1807,6 +2041,12 @@ def _submit_bots(
             if stance == "premium":
                 market_count = max(1, market_count - 1)
         selected_by_bot[int(bot["id"])] = _selected_markets(bot, markets, min(len(markets), market_count))
+        if previous_leader and int(bot["id"]) in top_standard_ids:
+            # Pick up the leader's real prior markets as well as our own home.
+            for index, market in enumerate(markets):
+                city = str(market["city"])
+                if city in previous_leader["cities"] and index not in selected_by_bot[int(bot["id"])]:
+                    selected_by_bot[int(bot["id"])].append(index)
     city_competitors: dict[int, int] = {}
     for index, market in enumerate(markets):
         seller_ids = {
@@ -1890,6 +2130,7 @@ def _submit_bots(
             super_mode
             and (late_disruptor or company_id in competitive_super_ids)
         )
+        race_for_first = bool(company_id == first_place_bot and round_no >= 4 and not late_disruptor)
         profile = int(bot["bot_profile"] if bot["bot_profile"] is not None else company_id) % 7
         normal_mix = _ordinary_mix(playbook_order[bot_position % len(playbook_order)])
         normal_ma, normal_qi, normal_mi, normal_price_stance, normal_pace, normal_mi_start, _ = normal_mix
@@ -1907,6 +2148,8 @@ def _submit_bots(
                 conn, company_id, round_no, previous_super_id,
             )
         chosen_predicted_profit: float | None = None
+        chosen_risk_profit = 0.0
+        chosen_sold = 0.0
         style = BOT_STYLES[profile]
         rng = _bot_rng(bot, round_no, super_mode, ordinary_seed)
         variation = rng.uniform(0.88, 1.14)
@@ -2072,6 +2315,24 @@ def _submit_bots(
             # and paid investments, rather than requested numbers, compete for
             # CPI and secondary allocation.
             funded_rivals = preview_round_operations(conn, round_no)
+            if company_id in top_standard_ids and official_round >= 2:
+                live_human_cities = {
+                    city for rival_id in human_ids
+                    for city, route in funded_rivals.get(rival_id, {}).get("city_decisions", {}).items()
+                    if route["agents_after"] > 0
+                }
+                cash_budget_for_city = max(0., float(bot["cash"]) + loan_change) * .05
+                for index, market in enumerate(markets):
+                    if str(market["city"]) not in live_human_cities or index in selected:
+                        continue
+                    delta, current = agent_plan[index]
+                    if current <= 0:
+                        if not max_agent_add or cash_budget_for_city < add_agent_cost:
+                            continue
+                        agent_plan[index] = (delta + 1, current + 1)
+                        agent_cost += add_agent_cost
+                        cash_budget_for_city -= add_agent_cost
+                    selected = [*selected, index]
             rival_asset_weights: dict[int, float] = {}
             own_rank = rank_by_company.get(company_id, len(rank_by_company) + 1)
 
@@ -2499,6 +2760,7 @@ def _submit_bots(
                 "quality": quality, "marketing": marketing, "staff_cost": staff_cost,
                 "agent_cost": agent_cost,
                 "core_total": staff_cost + material_cost + storage_cost + agent_cost,
+                "material_cost": material_cost,
                 "total": total,
             }
 
@@ -3535,6 +3797,153 @@ def _submit_bots(
                     forecast_market_sales(players=list(rival_players.values()), **forecast_args)
                     if super_mode else None
                 )
+                human_baseline = {}
+                active_humans = human_ids & rival_players.keys() if company_id in top_standard_ids else set()
+                real_rivals = (
+                    (set(funded_rivals) & rival_players.keys()) if race_for_first and use_complete_field
+                    else active_humans
+                )
+                for rival_id in sorted(real_rivals):
+                    actual = funded_rivals[rival_id]
+                    company = one(conn, "SELECT cash,debt,home_city FROM companies WHERE id=?", (rival_id,))
+                    plan_row = one(conn, "SELECT loan_change,research_investment FROM decisions WHERE company_id=? AND round_no=?",
+                                   (rival_id, round_no))
+                    if not plan_row:
+                        continue
+                    rival_home = next(m for m in markets if m["city"] == company["home_city"])
+                    sites = rival_players[rival_id]["cities"]
+                    fixed = (float(company["cash"]) + float(plan_row["loan_change"]) - float(actual["cash_pre_sales"])
+                             + float(plan_row["research_investment"])
+                             + (float(company["debt"]) + float(plan_row["loan_change"])) * float(rival_home["interest_rate"]))
+                    human_baseline[rival_id] = (fixed, str(company["home_city"]), float(company["cash"]) - float(company["debt"]), sites)
+
+                def human_profit(rival_id, after):
+                    fixed, rival_home, _, sites = human_baseline[rival_id]
+                    units = after["companies"][rival_id]["sold_units"]
+                    revenue = sum(count * (sites[city]["price"] - (transport_cost if city != rival_home else 0.))
+                                  for city, count in units.items() if city in sites)
+                    pre_tax = revenue - fixed
+                    return pre_tax - max(0., pre_tax * tax_rate)
+
+                projected_human = None
+                eligible_humans = active_humans & human_baseline.keys()
+                if company_id in top_standard_ids and eligible_humans:
+                    projected_human = max(eligible_humans, key=lambda i: (
+                        human_baseline[i][2] + human_profit(i, baseline_forecast), -i))
+                    # Copy funded current decisions, plus a previous champion
+                    # if its plan differs. Re-budget in our own home/capacity.
+                    human = rival_players[projected_human]
+                    profiles = [human]
+                    if previous_leader:
+                        profiles.append({**previous_leader, "ma_index": previous_leader["ma"],
+                                         "qi_index": previous_leader["qi"], "available": human["available"]})
+                    for rival in profiles:
+                        for investment, quote, volume in (
+                            (1., 1., 1.), (.8, 1., 1.), (1., .99, 1.),
+                            (1., 1.01, 1.15), (.72, .985, 1.25), (1.12, .98, 1.35),
+                        ):
+                            ma = float(rival["ma_index"]) * investment
+                            qi = float(rival["qi_index"]) * investment
+                            marketing = {i: investment * float(rival["cities"].get(str(markets[i]["city"]), {}).get("marketing", 0.))
+                                         for i in selected if agent_plan[i][1] > 0}
+                            prices = {city: float(values["price"]) * quote for city, values in rival["cities"].items()}
+                            groups = max(0, math.ceil((float(rival["available"]) * volume - old_products) / group["products"]))
+                            row = {"ma": ma, "qi": qi, "marketing": marketing, "groups": groups,
+                                   "price_ratio": .95, "human_seed": True, "forecast_prices": prices,
+                                   "marketing_total": sum(marketing.values())}
+                            shortlisted[id(row)] = row
+                    if race_for_first:
+                        # Compare the two naturally opposing routes: sell
+                        # premium into the investment pool or take price CPI
+                        # in the cities where the leader actually ships.
+                        active = [i for i in selected if agent_plan[i][1] > 0]
+                        leader_routes = human["cities"]
+                        for depth in (0., .02, .06, .13, .24, .38):
+                            for ma, qi, mi in ((1., 1., 0.), (ma_threshold * 1.2, 1., 0.),
+                                              (ma_threshold * 3, 1., .9), (1., qi_line * 2, 1.4)):
+                                budget_seed = evaluate_candidate(ma, qi, 0., .95, True, ())
+                                affordable = int(budget_seed["groups"])
+                                for fraction in (.16, .31, .50, .73, 1.):
+                                    quotes, marketing = {}, {}
+                                    for i in active:
+                                        city = str(markets[i]["city"])
+                                        cap = min(price_max, float(markets[i]["max_price"]))
+                                        rival = leader_routes.get(city)
+                                        if depth and rival:
+                                            anchor = min(float(rival["price"]), previous_prices[i] * .999)
+                                            quotes[city] = max(price_min, anchor * (1.-depth))
+                                        else:
+                                            quotes[city] = cap
+                                        if mi and rival:
+                                            marketing[i] = mi_thresholds[i] * mi
+                                    row = {**budget_seed, "marketing": marketing,
+                                           "marketing_total": sum(marketing.values()),
+                                           "groups": max(0, round(affordable * fraction)),
+                                           "human_seed": True, "forecast_prices": quotes}
+                                    shortlisted[id(row)] = row
+                    # The champion may be funded for many more units than we
+                    # can sell at their price. Probe lower-cost openers both
+                    # on their best routes and on the cities they leave room in.
+                    human_routes = human["cities"]
+                    by_city_capacity = {m["city"]: m["market_size"] for m in forecast_markets}
+                    human_sold = baseline_forecast["companies"][projected_human]["sold_units"]
+                    targets = sorted(
+                        (i for i in selected if str(markets[i]["city"]) in human_routes and agent_plan[i][1] > 0),
+                        key=lambda i: (
+                            -human_sold.get(str(markets[i]["city"]), 0)
+                             * human_routes[str(markets[i]["city"])]["price"], i),
+                    )
+                    focus = targets[:max(1, min(3, len(targets)))]
+                    if race_for_first and use_complete_field:
+                        # A rival can sell in every city. Undercut only its best
+                        # routes and keep premium prices on the rest of the map.
+                        active_routes = [i for i in selected if agent_plan[i][1] > 0]
+                        for target_count in sorted({2, max(2, len(targets) // 2), max(2, len(targets) - 2)}):
+                            contested = set(targets[:target_count])
+                            if not contested or contested.issuperset(active_routes):
+                                continue
+                            for depth in (.015, .08, .23):
+                                for ma, qi, mi_strength in ((1., 0., 0.), (ma_threshold * 1.25, 1., 1.25),
+                                                            (1., qi_line * 1.3, 1.9)):
+                                    seed = evaluate_candidate(ma, qi, 0., .95, True, ())
+                                    marketing = {i: mi_thresholds[i] * mi_strength for i in contested if mi_strength}
+                                    prices = {}
+                                    for i in active_routes:
+                                        city = str(markets[i]["city"])
+                                        cap = min(price_max, float(markets[i]["max_price"]))
+                                        prices[city] = (min(human_routes[city]["price"], previous_prices[i] * .999)
+                                                        * (1. - depth) if i in contested else cap)
+                                    for fraction in (.50, .78, 1.):
+                                        row = {**seed, "marketing": marketing, "marketing_total": sum(marketing.values()),
+                                               "groups": max(0, round(int(seed["groups"]) * fraction)),
+                                               "human_seed": True, "forecast_prices": prices}
+                                        shortlisted[id(row)] = row
+                    for ma, qi, mi_strength in ((1., 0., 0.), (ma_threshold * 1.1, 1., .9),
+                                                (float(human["ma_index"]) * .62, float(human["qi_index"]) * .65, 1.2)):
+                        marketing = {i: max(
+                            human_routes[str(markets[i]["city"])]["marketing"] * .6,
+                            mi_thresholds[i] * mi_strength,
+                        ) for i in focus if mi_strength > 0.}
+                        seed = evaluate_candidate(ma, qi, 0., .95, True, ())
+                        groups = int(seed["groups"])
+                        for fraction, undercut in ((.24, .98), (.46, .995), (.67, .94)):
+                            prices = {}
+                            for i in selected:
+                                city = str(markets[i]["city"])
+                                cap = min(price_max, float(markets[i]["max_price"]))
+                                if i in focus:
+                                    prices[city] = min(
+                                        human_routes[city]["price"] * undercut,
+                                        previous_prices[i] * .99,
+                                    )
+                                else:
+                                    prices[city] = cap * (
+                                        .995 if by_city_capacity[city] > sum(by_city_capacity.values()) / len(markets) else .95
+                                    )
+                            row = {**seed, "marketing": marketing, "groups": max(0, round(groups * fraction)),
+                                   "human_seed": True, "forecast_prices": prices,
+                                   "marketing_total": sum(marketing.values())}
+                            shortlisted[id(row)] = row
                 # Use the whole submitted field to find free demand, rather
                 # than treating the previous round's saturation as a quota.
                 # A share already sold by a rival remains contestable.
@@ -3685,6 +4094,7 @@ def _submit_bots(
                         effective_ratio = (ratio if low_price_unlocked or ratio >= .75
                                            else min(.98, max(.75, high_price_ratio)))
                         city = str(markets[index]["city"])
+                        copied_price = candidate.get("forecast_prices", {}).get(city, cap * effective_ratio)
                         own_cities[city] = {
                             "agents": agent_plan[index][1],
                             "marketing": float(candidate["marketing"].get(index, 0.0)),
@@ -3694,20 +4104,15 @@ def _submit_bots(
                                     cap,
                                     max(
                                         price_min,
-                                        cap * effective_ratio,
+                                        copied_price,
                                         0.0 if late_disruptor else direct_unit_cost * 1.03,
                                     ),
                                 ),
                             ),
                         }
-                    # Only the designated late disruptor has a city-by-city
-                    # price map that cannot be reconstructed from the shared
-                    # candidate ratio (covered pools use KDS minimum + 1 while
-                    # uncovered pools stay at their individual maxima).  For
-                    # every other Super Bot, rebuild prices from the ultimately
-                    # selected ratio so an optimiser or admin override cannot
-                    # be overwritten by a stale forecast value.
-                    if late_disruptor:
+                    # Preserve prices of plans with different quotes by city.
+                    # Plain ratio-based candidates are rebuilt at save time.
+                    if late_disruptor or candidate.get("human_seed") or candidate.get("expansion_probe"):
                         candidate["resolved_city_prices"] = {
                             city: float(data["price"])
                             for city, data in own_cities.items()
@@ -3770,6 +4175,12 @@ def _submit_bots(
                     if baseline_forecast is not None:
                         candidate.update(_super_target_pressure(
                             baseline_forecast, after_forecast, rival_player_list))
+                    if projected_human is not None:
+                        candidate["projected_human_profit"] = human_profit(projected_human, after_forecast)
+                    if race_for_first and human_baseline:
+                        candidate["first_place_gap"] = own_strategy_assets + candidate["predicted_profit"] - max(
+                            human_baseline[i][2] + human_profit(i, after_forecast) for i in human_baseline
+                        )
                     verified_candidates.append(candidate)
 
                 for prepared, after_forecast in zip(
@@ -3782,6 +4193,54 @@ def _submit_bots(
                 # second pass, so every refinement gets a fresh full forecast.
                 refinements = []
                 refinement_keys = set()
+                expand_late = (not late_disruptor and not competitive_mode
+                               and official_round >= max(4, math.ceil(total_rounds * .60)))
+                if expand_late:
+                    # Start from actual plans that sell out. Try scaling output
+                    # and testing different city-level bids, not buying the
+                    # same MA/QI/MI ratios in every market.
+                    seeds = sorted(
+                        (p for p in prepared_finalists if p[0]["sell_ratio"] >= .95 and p[0]["predicted_profit"] > 0),
+                        key=lambda p: float(p[0]["predicted_profit"]), reverse=True,
+                    )
+                    unique = set()
+                    for candidate, cities, _, _ in seeds:
+                        key = (candidate["ma"], candidate["qi"], tuple(
+                            (city, v["price"], v["marketing"]) for city, v in cities.items()))
+                        if key in unique:
+                            continue
+                        unique.add(key)
+                        if len(unique) > 3:
+                            break
+                        ma_index_target, qi_index_target = float(candidate["ma"]), float(candidate["qi"])
+                        if not cities:
+                            continue
+                        own_order = sorted(cities, key=lambda city: (
+                            -max(0., next(m["market_size"] for m in forecast_markets if m["city"] == city)
+                                 - baseline_city_sales[city]), city))
+                        emphasis = (own_order[:max(1,len(own_order)//2)] if profile % 3 != 2
+                                    else own_order[::2])
+                        for scale in (1.18, 1.42):
+                            for diversify in (False, True):
+                                count = max(int(candidate["groups"])+1, math.ceil(candidate["groups"]*scale))
+                                output = int(math.floor(count*group["products"]))
+                                revised = {city: dict(route) for city, route in cities.items()}
+                                if diversify:
+                                    for city in emphasis:
+                                        route = revised[city]
+                                        if profile % 3 != 1:
+                                            route["price"] = max(price_min, route["price"] * (.99 if profile % 3 == 0 else .975))
+                                        if profile % 3 != 0:
+                                            route["marketing"] *= 1.15
+                                marketing = {i: revised[str(markets[i]["city"])]["marketing"] for i in selected
+                                             if str(markets[i]["city"]) in revised}
+                                marketing_targets = marketing
+                                cost = budget_for(output)
+                                if float(cost["total"]) <= cash_budget + 1e-9:
+                                    refinements.append(({**candidate, "groups": count, "marketing": marketing,
+                                                          "expansion_probe": True,
+                                                          "resolved_city_prices": {city: route["price"] for city, route in revised.items()}},
+                                                         revised, old_products+output, cost))
                 lean = sorted(
                     (p for p in prepared_finalists if p[0].get("lean_secondary_route")),
                     key=lambda p: float(p[0]["predicted_profit"]), reverse=True,
@@ -3885,6 +4344,10 @@ def _submit_bots(
                     profit_target=profit_target,
                     competitive_mode=competitive_mode,
                     contest_market=True,
+                    expand_at_equal_profit=bool(expand_late) if finalist_candidates else False,
+                    human_benchmark=(human_profit(projected_human, baseline_forecast)
+                                     if finalist_candidates and projected_human is not None else None),
+                    race_for_first=race_for_first,
                     sacrifice_allowed=bool(
                         last_round
                         and competitive_mode
@@ -3902,6 +4365,8 @@ def _submit_bots(
 
             if best_candidate is not None:
                 chosen_predicted_profit = float(best_candidate.get("predicted_profit", 0.0))
+                chosen_risk_profit = float(best_candidate.get("risk_profit", chosen_predicted_profit))
+                chosen_sold = float(best_candidate.get("predicted_sold", 0.0))
                 ma_index_target = float(best_candidate["ma"])
                 qi_index_target = float(best_candidate["qi"])
                 marketing_targets = dict(best_candidate["marketing"])
@@ -3953,20 +4418,14 @@ def _submit_bots(
                     production = int(math.floor(chosen_groups * group["products"]))
                     budget = affordable_budget
                     chosen_predicted_profit = 0.0
+                    chosen_risk_profit = chosen_sold = 0.0
                 city_rows = make_city_rows(
                     False,
                     float(best_candidate["price_ratio"]),
                 )
-                # Ordinary strategic Super candidates are saved from the
-                # selected price ratio so a selector may still adjust that
-                # ratio after the forecast pass.  Only late disruptors need
-                # the city-specific resolved prices: they may deliberately
-                # sell below direct cost, and the designated floor locker uses
-                # a different price in covered and uncovered cities.
-                resolved_city_prices = (
-                    best_candidate.get("resolved_city_prices", {})
-                    if late_disruptor else {}
-                )
+                # Keep city-specific bids exactly as tested. Ordinary uniform
+                # candidates still follow their finally selected ratio.
+                resolved_city_prices = best_candidate.get("resolved_city_prices", {})
                 if resolved_city_prices:
                     for city_row in city_rows:
                         city = str(city_row["city"])
@@ -4006,34 +4465,23 @@ def _submit_bots(
             # the incoming revenue.
             projected_cash = cash_budget + chosen_predicted_profit + forecast_interest
         operating_reserve = max(float(bot["cash"]) * 0.06, float(budget["staff_cost"]) * 0.50)
-        early_patent_compounding = bool(
-            super_mode
-            and total_rounds - official_round >= 2
-            and not all_markets_full
-            and prior_surplus_ratio < 0.20
-            and chosen_predicted_profit is not None
-            and chosen_predicted_profit >= research_needed * 1.25
-        )
         research_ready = (
             not last_round and research_needed > 0
-            and not late_disruptor
             and not distress_liquidation
             and projected_cash - research_needed >= operating_reserve
-            and (
-                not super_mode
-                or early_patent_compounding
-                or (
-                    official_round >= 4
-                    and cash_budget >= research_goal * 4.0
-                    and projected_cash - research_needed >= cash_budget * 1.05
-                    and (
-                        chosen_predicted_profit is None
-                        or chosen_predicted_profit - research_needed > profit_target
-                    )
-                )
-            )
         )
-        research = research_needed if research_ready else 0.0
+        research = research_needed if research_ready and not super_mode else 0.0
+        if super_mode and not late_disruptor and chosen_predicted_profit is not None:
+            research = _profitable_patent_budget(
+                balance=research_balance, remaining_rounds=total_rounds-official_round,
+                material_spend=float(budget["material_cost"]), sold=chosen_sold,
+                available=old_products+production, projected_cash=projected_cash,
+                reserve=operating_reserve, risk_profit=chosen_risk_profit,
+                amount_25=setting("research_25", 1_500_000), amount_75=setting("research_75", 6_000_000),
+                hidden_cap=setting("research_probability_cap", .43),
+                hidden_multiplier=setting("research_hidden_threshold_multiplier", 4/3),
+                buffer=setting("research_buffer", 150_000), patent_factor=patent_factor, tax_rate=tax_rate,
+            )
 
         # Replace only this Bot, and only after its complete candidate search
         # has succeeded. If analysis stops before this point, its old decision
