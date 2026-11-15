@@ -99,6 +99,74 @@ class PlayerDecisionDraftAppTest(unittest.TestCase):
                 )
             )
 
+    def test_genius_mode_admin_grant_preview_and_submission(self) -> None:
+        from sim.engine import preview_round_operations
+        from sim.genius import has_genius_access
+
+        with self.db.connect() as conn:
+            conn.execute("UPDATE companies SET patents=2 WHERE id=?", (self.company_id,))
+            conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,'广州',1)", (self.company_id,))
+
+        player = AppTest.from_file(self.app_path, default_timeout=30)
+        player.session_state["auth"] = {"role": "player", "company_id": self.company_id}
+        player.session_state["player_navigation"] = "决策"
+        player.run()
+        self.assertFalse(player.exception)
+        self.assertFalse(any(toggle.label == "使用天才模式" for toggle in player.toggle))
+
+        admin = AppTest.from_file(self.app_path, default_timeout=30)
+        admin.session_state["auth"] = {"role": "admin"}
+        admin.run()
+        admin.sidebar.radio[0].set_value("队伍管理").run()
+        grant = admin.checkbox(key=f"genius_grant_{self.company_id}")
+        grant.check()
+        next(btn for btn in admin.button if btn.label == "保存天才模式权限").click().run()
+        self.assertFalse(admin.exception)
+        with self.db.connect() as conn:
+            self.assertTrue(has_genius_access(conn, self.company_id))
+
+        player.run()
+        self.assertFalse(player.exception)
+        prefix = f"player_decision_draft:{self.company_id}:1:genius:"
+        action = f"player_genius_action:{self.company_id}:1:"
+        player.number_input(key=f"{prefix}reserve").set_value(1_000_000.125)
+        player.number_input(key=f"{prefix}research_investment").set_value(500_000.125)
+        player.number_input(key=f"{prefix}management_investment").set_value(123_456.789)
+        player.number_input(key=f"{prefix}深圳:marketing").set_value(300_000.125)
+        player.button(key=f"{action}calculate").click().run()
+        self.assertFalse(player.exception)
+        self.assertTrue(any("49.000%" in c.value and "广州" in c.value for c in player.caption))
+        finance = player.dataframe[0].value
+        pre_sales = finance.loc[finance["项目"] == "售前剩余现金", "预计余额"].iloc[0]
+        self.assertGreaterEqual(pre_sales, 1_000_000.125)
+        self.assertLess(pre_sales, 1_025_000.)
+        self.assertAlmostEqual(float(finance.loc[finance["项目"] == "研发 / 专利投入", "现金变化"].iloc[0]),
+                               -500_000.125, places=3)
+        with self.db.connect() as conn:
+            self.assertIsNone(self.db.one(conn, "SELECT 1 FROM decisions WHERE company_id=?", (self.company_id,)))
+
+        player.number_input(key=f"{prefix}reserve").set_value(1_200_000.125).run()
+        self.assertFalse(any(btn.key == f"{action}submit" for btn in player.button))
+        player.button(key=f"{action}calculate").click().run()
+        latest_finance = player.dataframe[0].value
+        confirmed_balance = latest_finance.loc[latest_finance["项目"] == "售前剩余现金", "预计余额"].iloc[0]
+        player.button(key=f"{action}submit").click().run()
+        self.assertFalse(player.exception)
+        with self.db.connect() as conn:
+            submitted = self.db.one(conn, "SELECT * FROM decisions WHERE company_id=? AND round_no=1",
+                                    (self.company_id,))
+            self.assertIsNotNone(submitted["submitted_at"])
+            self.assertGreater(submitted["production_volume"], 0)
+            self.assertAlmostEqual(submitted["management_investment"], 123_456.789, places=3)
+            shenzhen = self.db.one(conn, "SELECT * FROM city_decisions WHERE company_id=? AND city='深圳'",
+                                   (self.company_id,))
+            self.assertEqual(shenzhen["agent_delta"], 1)
+            self.assertAlmostEqual(shenzhen["marketing_investment"], 300_000.125, places=3)
+            conn.execute("UPDATE companies SET home_city='广州' WHERE id<>?", (self.company_id,))
+            operations = preview_round_operations(conn, 1)[self.company_id]
+            self.assertEqual(operations["produced"], submitted["production_volume"])
+            self.assertAlmostEqual(operations["cash_pre_sales"], confirmed_balance, places=3)
+
 
 if __name__ == "__main__":
     unittest.main()

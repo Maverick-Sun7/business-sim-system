@@ -38,7 +38,7 @@ from sim import ai_training as _ai_training_module
 # import one consistent version of the application.
 if (
     not hasattr(_db_module, "delete_city")
-    or getattr(_db_module, "DB_API_VERSION", 0) < 10
+    or getattr(_db_module, "DB_API_VERSION", 0) < 11
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
@@ -127,6 +127,7 @@ from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
 from sim.engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, market_size, settle_round, weighted_market_average
 from sim.report_pdf import build_round_report_pdf
 from sim.finance import asset_reconciliation, build_finance_ledger
+from sim.genius import has_genius_access, plan_genius_decision, set_genius_access, write_decision
 from sim.kds_pdf import build_public_kds_pdf
 from sim.local_launcher import build_local_worker_launcher_zip
 
@@ -1232,13 +1233,17 @@ def render_submitted_decision(
     city_values: dict[str, dict[str, Any]],
     loan_base_net_assets: float,
     loan_limit: float,
+    *,
+    decimal_amounts: bool = False,
 ) -> None:
     """Show the player's locked submission without rendering editable widgets."""
+    show_amount = (lambda value: f"¥{float(value):,.3f}") if decimal_amounts else money
+    amount_format = "¥ %.3f" if decimal_amounts else "¥ %.0f"
     st.success(f"本轮决策已提交并锁定；提交时间：{str(decision['submitted_at'])[:19].replace('T', ' ')} UTC")
     loan_cols = st.columns(3)
-    loan_cols[0].metric("贷款计算净资产", money(loan_base_net_assets))
-    loan_cols[1].metric("本轮最高新增贷款", money(loan_limit))
-    loan_cols[2].metric("本轮贷款变化", money(decision["loan_change"]))
+    loan_cols[0].metric("贷款计算净资产", show_amount(loan_base_net_assets))
+    loan_cols[1].metric("本轮最高新增贷款", show_amount(loan_limit))
+    loan_cols[2].metric("本轮贷款变化", show_amount(decision["loan_change"]))
     st.markdown("#### 人力与生产")
     st.dataframe(
         pd.DataFrame(
@@ -1249,13 +1254,13 @@ def render_submitted_decision(
         ),
         hide_index=True,
         use_container_width=True,
-        column_config={"月薪": st.column_config.NumberColumn(format="¥ %.0f")},
+        column_config={"月薪": st.column_config.NumberColumn(format=amount_format)},
     )
     investment_cols = st.columns(4)
     investment_cols[0].metric("计划生产", number(decision["production_volume"]))
-    investment_cols[1].metric("MA", money(decision["management_investment"]))
-    investment_cols[2].metric("QI", money(decision["quality_investment"]))
-    investment_cols[3].metric("专利投入", money(decision["research_investment"]))
+    investment_cols[1].metric("MA", show_amount(decision["management_investment"]))
+    investment_cols[2].metric("QI", show_amount(decision["quality_investment"]))
+    investment_cols[3].metric("专利投入", show_amount(decision["research_investment"]))
     st.markdown("#### 城市销售决策")
     city_rows = [
         {
@@ -1272,10 +1277,132 @@ def render_submitted_decision(
         hide_index=True,
         use_container_width=True,
         column_config={
-            "营销投入": st.column_config.NumberColumn(format="¥ %.0f"),
-            "售价": st.column_config.NumberColumn(format="¥ %.0f"),
+            "营销投入": st.column_config.NumberColumn(format=amount_format),
+            "售价": st.column_config.NumberColumn(format=amount_format),
         },
     )
+
+
+def lock_player_submission(conn, company_id, viewed_round, *, require_genius=False):
+    conn.execute("BEGIN IMMEDIATE")
+    latest = current_round(conn)
+    ends = parse_time(latest["ends_at"]) if latest else None
+    round_no = int(viewed_round["round_no"])
+    if (
+        not latest or latest["status"] != "open"
+        or latest["round_no"] != round_no or latest["starts_at"] != viewed_round["starts_at"]
+        or (ends and datetime.now(timezone.utc) > ends)
+    ):
+        raise ValueError("回合状态已经变化，本次提交未保存。")
+    if get_setting(conn, "ai_training_processing_round", 0, int) == round_no:
+        raise ValueError("本轮已经进入核算阶段，本次提交未保存。")
+    if one(conn, "SELECT 1 FROM decisions WHERE company_id=? AND round_no=? AND submitted_at IS NOT NULL",
+           (company_id, round_no)):
+        raise ValueError("本轮决策已经提交并锁定。")
+    if require_genius and not has_genius_access(conn, company_id):
+        raise ValueError("管理员已收回天才模式权限，本次提交未保存。")
+
+
+def render_genius_decision(company, round_row, settings, markets, draft, city_values,
+                           worker_bounds, engineer_bounds, loan_limit, minimum_loan, prefix):
+    company_id, round_no = int(company["id"]), int(round_row["round_no"])
+    key = f"{prefix}genius:"
+    action_key = f"player_genius_action:{company_id}:{round_no}:"
+    st.subheader("天才模式")
+    st.caption(f"按 {company['home_city']} 的生产数据和本队已有专利计算。预留现金指销售收入到账前的余额。")
+
+    def amount(container, label, field, default=0., low=0., high=None, step=10_000.):
+        value = max(float(default), low)
+        if high is not None:
+            value = min(value, high)
+        return container.number_input(label, min_value=low, max_value=high, value=value,
+                                      step=step, format="%.3f", key=f"{key}{field}")
+
+    left, right = st.columns(2)
+    parameters = {
+        "worker_salary": amount(left, "工人月薪", "worker_salary", draft["worker_salary"],
+                                *worker_bounds, step=50.),
+        "engineer_salary": amount(right, "工程师月薪", "engineer_salary", draft["engineer_salary"],
+                                  *engineer_bounds, step=50.),
+        "management_investment": amount(left, "管理总投入（MA）", "management_investment",
+                                        draft["management_investment"]),
+        "quality_investment": amount(right, "品质总投入（QI）", "quality_investment",
+                                     draft["quality_investment"]),
+        "reserve": amount(left, "售前预留现金", "reserve"),
+        "loan_change": amount(right, "贷款变化（负数为还款）", "loan_change", draft["loan_change"],
+                              -min(float(company["cash"]), float(company["debt"])), float(loan_limit)),
+        "research_investment": amount(left, "本轮研发 / 专利投入", "research_investment",
+                                      draft["research_investment"]),
+        "sell_through": amount(right, "预计售出比例（%）", "sell_through", 80., 0., 100., step=5.),
+    }
+    st.caption(f"新增贷款最低 ¥{minimum_loan:,.3f}。收入按假设售出比例估算，并按已开城市的市场容量分配。")
+    st.markdown("#### 各城市营销投入（MI）")
+    cities = {}
+    for market in markets:
+        city = str(market["city"])
+        saved = city_values[city]
+        marketing = amount(st, f"{city} MI", f"{city}:marketing", saved["marketing_investment"])
+        current_agents = int(saved["current_agents"])
+        max_add = max(0, int(settings["max_agent_add_per_city_round"]))
+        cap = min(float(settings["price_max"]), float(market["max_price"]))
+        with st.expander(f"{city} · 售价、Agent 和市场报告"):
+            agent_input = st.number_input("Agent 增减（0 为保持不变）", min_value=-current_agents,
+                                          max_value=max_add, value=max(-current_agents, min(max_add, int(saved["agent_delta"]))),
+                                          step=1, key=f"{key}{city}:agent")
+            quote = amount(st, "售价", f"{city}:price", saved["price"], float(settings["price_min"]), cap, step=50.)
+            reports = st.checkbox("购买市场报告", value=bool(saved["order_report"]), key=f"{key}{city}:report")
+        if marketing > 0 and current_agents == 0 and agent_input == 0 and max_add:
+            agent_input = 1
+            st.caption(f"{city} 暂无 Agent，方案会自动新增 1 个以启用 MI。")
+        cities[city] = dict(agent_delta=agent_input, marketing_investment=marketing, price=quote,
+                            order_report=int(reports))
+
+    signature = (round_row["starts_at"], parameters, cities)
+    preview_key = f"{key}preview"
+    if st.button("计算产量与现金流", type="primary", key=f"{action_key}calculate"):
+        st.session_state.pop(preview_key, None)
+        try:
+            with connect() as conn:
+                conn.execute("BEGIN")
+                plan = plan_genius_decision(conn, company_id, round_no, parameters, cities)
+            st.session_state[preview_key] = (signature, plan)
+        except ValueError as exc:
+            st.error(str(exc))
+    preview = st.session_state.get(preview_key)
+    if preview is None or signature != preview[0]:
+        if preview is not None:
+            st.info("参数已修改，请重新计算后提交。")
+        return
+    plan = preview[1]
+    finance = plan["cashflow"]
+    cost_percent = plan["material_factor"] * 100
+    st.caption(f"主场：{plan['home']}。已有 {plan['patents']} 项生效专利，材料单价为主场基准的 {cost_percent:,.3f}%。")
+    columns = st.columns(3)
+    columns[0].metric("计划生产", f"{plan['decision']['production_volume']:,} 件")
+    columns[1].metric("预计用工", f"{plan['workers']:,} 工人 / {plan['engineers']:,} 工程师")
+    columns[2].metric("预计售前现金", f"¥{plan['cash_before_sales']:,.3f}")
+    st.caption(f"预计可售 {plan['stock']:,} 件，假设售出 {finance['sold']:,} 件，预计期末负债 ¥{finance['debt']:,.3f}。")
+    st.dataframe(pd.DataFrame(finance["rows"], columns=["项目", "现金变化", "预计余额"]),
+                 hide_index=True, use_container_width=True, column_config={
+                     "现金变化": st.column_config.NumberColumn(format="%.3f"),
+                     "预计余额": st.column_config.NumberColumn(format="%.3f"),
+                 })
+    st.caption("工资和用工按主场基准与本队数据估算。实际结果会随同主场工资和市场竞争变化。")
+    if st.button("确认提交计算方案", key=f"{action_key}submit", use_container_width=True):
+        try:
+            with connect() as conn:
+                lock_player_submission(conn, company_id, round_row, require_genius=True)
+                refreshed = plan_genius_decision(conn, company_id, round_no, parameters, cities)
+                if refreshed != plan:
+                    st.session_state.pop(preview_key, None)
+                    raise ValueError("现金、主场配置或队伍资料已更新，请重新计算后确认。")
+                write_decision(conn, company_id, round_no, plan["decision"], plan["cities"])
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        flash("success", "天才模式方案已提交并锁定。")
+        clear_player_decision_draft(company_id, round_no)
+        st.rerun()
 
 
 def render_player_decision(company: sqlite3.Row) -> None:
@@ -1331,6 +1458,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
             loan_ceiling,
         )
         minimum_new_loan = float(home["min_loan"])
+        genius_enabled = has_genius_access(conn, int(company["id"]))
 
     st.markdown(
         f'<div class="hint">工资建议：工人约 <b>{money(helper["worker_wage"])}</b>，工程师约 '
@@ -1338,7 +1466,8 @@ def render_player_decision(company: sqlite3.Row) -> None:
         unsafe_allow_html=True,
     )
     if decision.get("submitted_at"):
-        render_submitted_decision(decision, city_values, loan_base_net_assets, loan_limit)
+        render_submitted_decision(decision, city_values, loan_base_net_assets, loan_limit,
+                                  decimal_amounts=genius_enabled)
         return
     if round_row["status"] != "open":
         st.warning("当前回合未开放决策。")
@@ -1353,6 +1482,16 @@ def render_player_decision(company: sqlite3.Row) -> None:
     st.caption("总资产就是现金，库存不计资产。工资按三个月支付；工资、材料、仓储、Agent 和 MI → QI → MA 都在销售收入到账前支付。")
 
     widget_prefix = player_decision_widget_prefix(int(company["id"]), round_no)
+    if genius_enabled:
+        genius_key = f"{widget_prefix}genius"
+        st.session_state.setdefault(genius_key, True)
+        if st.toggle("使用天才模式", key=genius_key):
+            render_genius_decision(
+                company, round_row, settings, markets, decision, city_values,
+                (worker_salary_low, worker_salary_high), (engineer_salary_low, engineer_salary_high),
+                loan_limit, minimum_new_loan, widget_prefix,
+            )
+            return
     with st.container():
         loan_min = -float(company["debt"])
         loan_max = max(0.0, loan_limit)
@@ -1506,45 +1645,18 @@ def render_player_decision(company: sqlite3.Row) -> None:
             for error in errors:
                 st.error(error)
             return
-        with connect() as conn:
-            latest_round = current_round(conn)
-            latest_end = parse_time(latest_round["ends_at"]) if latest_round else None
-            processing_round = get_setting(
-                conn, "ai_training_processing_round", 0, int
-            )
-            if not latest_round or latest_round["status"] != "open" or int(latest_round["round_no"]) != round_no or (latest_end and datetime.now(timezone.utc) > latest_end):
-                st.error("回合状态已经变化，本次提交未保存。")
-                return
-            if int(processing_round) == round_no:
-                st.error("本轮已经进入核算阶段，本次提交未保存。")
-                return
-            already_submitted = one(
-                conn,
-                "SELECT submitted_at FROM decisions WHERE company_id=? AND round_no=? AND submitted_at IS NOT NULL",
-                (company["id"], round_no),
-            )
-            if already_submitted:
-                st.warning("本轮决策已经提交并锁定，本次修改未保存。")
-                return
-            conn.execute(
-                "INSERT INTO decisions(company_id,round_no,loan_change,worker_delta,worker_salary,engineer_delta,engineer_salary,"
-                "management_investment,production_volume,quality_investment,research_investment,submitted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(company_id,round_no) DO UPDATE SET loan_change=excluded.loan_change,worker_delta=excluded.worker_delta,"
-                "worker_salary=excluded.worker_salary,engineer_delta=excluded.engineer_delta,engineer_salary=excluded.engineer_salary,"
-                "management_investment=excluded.management_investment,production_volume=excluded.production_volume,"
-                "quality_investment=excluded.quality_investment,research_investment=excluded.research_investment,submitted_at=excluded.submitted_at",
-                (
-                    company["id"], round_no, loan_change, int(worker_delta), worker_salary, int(engineer_delta), engineer_salary,
-                    management, int(production_volume), quality, research, now_iso(),
-                ),
-            )
-            for city, values in city_inputs.items():
-                conn.execute(
-                    "INSERT INTO city_decisions(company_id,round_no,city,agent_delta,marketing_investment,price,order_report) "
-                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(company_id,round_no,city) DO UPDATE SET agent_delta=excluded.agent_delta,"
-                    "marketing_investment=excluded.marketing_investment,price=excluded.price,order_report=excluded.order_report",
-                    (company["id"], round_no, city, values["agent_delta"], values["marketing_investment"], values["price"], values["order_report"]),
-                )
+        try:
+            with connect() as conn:
+                lock_player_submission(conn, int(company["id"]), round_row)
+                write_decision(conn, int(company["id"]), round_no, {
+                    "loan_change": loan_change, "worker_delta": int(worker_delta), "worker_salary": worker_salary,
+                    "engineer_delta": int(engineer_delta), "engineer_salary": engineer_salary,
+                    "management_investment": management, "production_volume": int(production_volume),
+                    "quality_investment": quality, "research_investment": research,
+                }, city_inputs)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
         flash("success", "本轮决策已提交并锁定。")
         clear_player_decision_draft(int(company["id"]), round_no)
         st.rerun()
@@ -2173,7 +2285,10 @@ def render_admin_companies() -> None:
                 st.error("账号或公司名称重复。")
 
     with connect() as conn:
-        companies = all_rows(conn, "SELECT * FROM companies ORDER BY id")
+        companies = all_rows(
+            conn, "SELECT c.*, g.company_id IS NOT NULL AS genius_enabled FROM companies c "
+                  "LEFT JOIN genius_mode_grants g ON g.company_id=c.id ORDER BY c.id",
+        )
         markets = all_rows(conn, "SELECT city FROM market_config WHERE home_enabled=1 ORDER BY city")
         round_row = current_round(conn)
     setup_editable = bool(round_row and round_row["status"] == "waiting")
@@ -2266,6 +2381,20 @@ def render_admin_companies() -> None:
             else (" · 超级 BOT" if bool(company["is_super_bot"]) else " · BOT")
         ) if bool(company["is_bot"]) else ""
         with st.expander(f"{company['code']} · {company['name']} · {company['home_city'] or '未选主场'}{bot_tag}"):
+            if not company["is_bot"]:
+                company_id = int(company["id"])
+                with st.form(f"admin_genius_{company_id}"):
+                    grant = st.checkbox("授予天才模式", value=bool(company["genius_enabled"]), key=f"genius_grant_{company_id}",
+                                        help="授权后，该玩家可以在决策页使用自动产量计算和现金流预览。")
+                    save_grant = st.form_submit_button("保存天才模式权限")
+                if save_grant:
+                    try:
+                        with connect() as conn:
+                            set_genius_access(conn, company_id, grant)
+                        flash("success", f"{company['code']} 的天才模式已{'开启' if grant else '关闭'}。")
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
             st.markdown("##### 代管赛前资料")
             with st.form(f"admin_company_setup_{company['id']}"):
                 setup_cols = st.columns([2, 2, 1])

@@ -18,7 +18,7 @@ from .defaults import DEFAULT_MARKETS, DEFAULT_SETTINGS
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.environ.get("SIM_DB_PATH", BASE_DIR / "data" / "sim.db"))
-DB_API_VERSION = 10
+DB_API_VERSION = 11
 
 
 def now_iso() -> str:
@@ -135,6 +135,9 @@ def init_db() -> None:
                 count INTEGER NOT NULL CHECK(count >= 0),
                 hire_round INTEGER NOT NULL,
                 FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS genius_mode_grants(
+                company_id INTEGER PRIMARY KEY REFERENCES companies(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS market_config(
                 city TEXT PRIMARY KEY,
