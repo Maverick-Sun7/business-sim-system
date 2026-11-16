@@ -125,23 +125,23 @@ class PlayerDecisionDraftAppTest(unittest.TestCase):
         with self.db.connect() as conn:
             self.assertTrue(has_genius_access(conn, self.company_id))
 
+        player = AppTest.from_file(self.app_path, default_timeout=30)
+        player.session_state["auth"] = {"role": "player", "company_id": self.company_id}
+        player.session_state["player_navigation"] = "决策"
         player.run()
         self.assertFalse(player.exception)
         prefix = f"player_decision_draft:{self.company_id}:1:genius:"
         action = f"player_genius_action:{self.company_id}:1:"
         player.number_input(key=f"{prefix}reserve").set_value(1_000_000.125)
-        player.number_input(key=f"{prefix}research_investment").set_value(500_000.125)
-        player.number_input(key=f"{prefix}management_investment").set_value(123_456.789)
-        player.number_input(key=f"{prefix}深圳:marketing").set_value(300_000.125)
+        player.number_input(key=f"{prefix}management_index").set_value(123.456)
+        player.number_input(key=f"{prefix}quality_index").set_value(17.25)
+        player.number_input(key=f"{prefix}深圳:mi_index").set_value(300.125)
         player.button(key=f"{action}calculate").click().run()
         self.assertFalse(player.exception)
         self.assertTrue(any("49.000%" in c.value and "广州" in c.value for c in player.caption))
         finance = player.dataframe[0].value
         pre_sales = finance.loc[finance["项目"] == "售前剩余现金", "预计余额"].iloc[0]
         self.assertGreaterEqual(pre_sales, 1_000_000.125)
-        self.assertLess(pre_sales, 1_025_000.)
-        self.assertAlmostEqual(float(finance.loc[finance["项目"] == "研发 / 专利投入", "现金变化"].iloc[0]),
-                               -500_000.125, places=3)
         with self.db.connect() as conn:
             self.assertIsNone(self.db.one(conn, "SELECT 1 FROM decisions WHERE company_id=?", (self.company_id,)))
 
@@ -157,12 +157,19 @@ class PlayerDecisionDraftAppTest(unittest.TestCase):
                                     (self.company_id,))
             self.assertIsNotNone(submitted["submitted_at"])
             self.assertGreater(submitted["production_volume"], 0)
-            self.assertAlmostEqual(submitted["management_investment"], 123_456.789, places=3)
+            conn.execute("UPDATE companies SET home_city='广州' WHERE id<>?", (self.company_id,))
+            operations = preview_round_operations(conn, 1)[self.company_id]
+            old_products = self.db.one(conn, "SELECT product_inventory FROM companies WHERE id=?",
+                                       (self.company_id,))["product_inventory"]
+            self.assertAlmostEqual(submitted["management_investment"],
+                                   123.456 * (operations["workers"] + operations["engineers"]), places=3)
+            self.assertAlmostEqual(submitted["quality_investment"],
+                                   17.25 * (old_products * 1.2 + submitted["production_volume"]), places=3)
             shenzhen = self.db.one(conn, "SELECT * FROM city_decisions WHERE company_id=? AND city='深圳'",
                                    (self.company_id,))
             self.assertEqual(shenzhen["agent_delta"], 1)
-            self.assertAlmostEqual(shenzhen["marketing_investment"], 300_000.125, places=3)
-            conn.execute("UPDATE companies SET home_city='广州' WHERE id<>?", (self.company_id,))
+            self.assertAlmostEqual(shenzhen["marketing_investment"],
+                                   300.125 * (operations["workers"] + operations["engineers"]), places=3)
             operations = preview_round_operations(conn, 1)[self.company_id]
             self.assertEqual(operations["produced"], submitted["production_volume"])
             self.assertAlmostEqual(operations["cash_pre_sales"], confirmed_balance, places=3)

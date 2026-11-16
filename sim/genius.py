@@ -3,6 +3,8 @@
 import math
 import sqlite3
 from contextlib import closing
+from fractions import Fraction
+from math import gcd, lcm
 
 from .db import all_rows, one, settings_dict, now_iso
 from .engine import (
@@ -76,8 +78,24 @@ def _staff_planner(conn, company_id, round_no, role, wage, initial_wage):
     return staff_delta
 
 
+def _production_group(settings):
+    """Return the smallest whole KDS production group as (workers, engineers, products)."""
+    component_need = max(1, int(round(float(settings["components_per_product"]))))
+    worker_rate = (Fraction(str(settings["component_workers"]))
+                   * Fraction(str(settings["component_hours"])) * component_need / 504)
+    engineer_rate = (Fraction(str(settings["product_engineers"]))
+                     * Fraction(str(settings["product_hours"])) / 504)
+    denominator = lcm(worker_rate.denominator, engineer_rate.denominator)
+    worker_units = worker_rate.numerator * (denominator // worker_rate.denominator)
+    engineer_units = engineer_rate.numerator * (denominator // engineer_rate.denominator)
+    divisor = gcd(worker_units, engineer_units)
+    if divisor == 0:
+        raise ValueError("KDS 每件产品至少需要一种员工工时，无法计算生产组。")
+    return worker_units // divisor, engineer_units // divisor, denominator // divisor
+
+
 def plan_genius_decision(conn, company_id, round_no, parameters, cities):
-    """Size production on a private copy using only the player's own inputs."""
+    """Turn player-entered indices into a whole-group KDS plan on a private copy."""
     if not has_genius_access(conn, company_id):
         raise ValueError("此队伍当前未获授天才模式。")
     company = one(conn, "SELECT * FROM companies WHERE id=?", (company_id,))
@@ -87,9 +105,20 @@ def plan_genius_decision(conn, company_id, round_no, parameters, cities):
     markets = {row["city"]: row for row in all_rows(conn, "SELECT * FROM market_config ORDER BY city")}
     if markets.keys() != cities.keys():
         raise ValueError("市场配置已变化，请刷新后重新计算。")
-    amounts = [*parameters.values(), *(route["marketing_investment"] for route in cities.values())]
-    if any(not math.isfinite(value) for value in amounts):
-        raise ValueError("请输入有效的金额和比例。")
+    for city, route in cities.items():
+        current = one(conn, "SELECT count FROM agents WHERE company_id=? AND city=?", (company_id, city))
+        if route["mi_index"] > 0 and max(0, int(current["count"]) if current else 0) + int(route["agent_delta"]) <= 0:
+            raise ValueError(f"{city} 有 MI 指数但没有 Agent，无法产生市场效果。请先在普通决策中设置 Agent。")
+    index_values = [parameters[name] for name in ("management_index", "quality_index")]
+    index_values.extend(route["mi_index"] for route in cities.values())
+    numeric_values = [*index_values, parameters["worker_salary"], parameters["engineer_salary"],
+                      parameters["reserve"], parameters["loan_change"],
+                      float(parameters.get("research_investment", 0.))]
+    if any(not math.isfinite(value) for value in numeric_values):
+        raise ValueError("工资、指数、留存现金和贷款必须是有效数字。")
+    if any(value < 0 for value in [*index_values, parameters["worker_salary"],
+                                   parameters["engineer_salary"], parameters["reserve"]]):
+        raise ValueError("指数和预留现金请输入有效的非负数。")
     settings = settings_dict(conn)
     cash, reserve, loan = float(company["cash"]), parameters["reserve"], parameters["loan_change"]
     ceiling = loan_ceiling_for_round(round_no, home, settings["global_max_loan"])
@@ -97,18 +126,14 @@ def plan_genius_decision(conn, company_id, round_no, parameters, cities):
                                      settings["loan_asset_threshold"], home["min_loan"], ceiling)
     if loan < -min(company["debt"], cash) or loan > loan_limit or 0 < loan < home["min_loan"]:
         raise ValueError("贷款或还款金额超出主场与本轮允许的范围。")
-    opening_funds = cash + loan
-    fixed_investment = (parameters["management_investment"] + parameters["quality_investment"]
-                        + sum(route["marketing_investment"] for route in cities.values()))
-    if reserve + fixed_investment > opening_funds + 1e-6:
-        raise ValueError("预留现金加上 MA、QI、MI 已超过可用资金。请调低其中一项。")
-
     staff = {
         role: _staff_planner(conn, company_id, round_no, role,
                              parameters[f"{role}_salary"], home[f"{role}_initial_salary"])
         for role in ("worker", "engineer")
     }
-    component_count = max(1, round(settings["components_per_product"]))
+    component_count = max(1, int(round(float(settings["components_per_product"]))))
+    workers_per_group, engineers_per_group, products_per_group = _production_group(settings)
+    group = (workers_per_group, engineers_per_group, products_per_group)
     image = bytearray(conn.serialize())
     image[18:20] = b"\x01\x01"
     with closing(sqlite3.connect(":memory:")) as sandbox:
@@ -119,23 +144,42 @@ def plan_genius_decision(conn, company_id, round_no, parameters, cities):
         sandbox.execute("DELETE FROM companies WHERE id<>?", (company_id,))
         sandbox.execute("DELETE FROM results WHERE round_no=?", (round_no,))
 
-        def evaluate(units):
-            components = max(0, units * component_count - company["component_inventory"])
-            decision = {field: parameters[field] for field in DECISION_FIELDS if field in parameters}
-            decision.update(
-                production_volume=units,
-                worker_delta=staff["worker"](
-                    components * settings["component_workers"] * settings["component_hours"] / 504.),
-                engineer_delta=staff["engineer"](
-                    units * settings["product_engineers"] * settings["product_hours"] / 504.),
-            )
+        def simulate(decision, routes):
             sandbox.execute("SAVEPOINT genius_probe")
             try:
-                write_decision(sandbox, company_id, round_no, decision, cities)
-                state = settle_round(sandbox, round_no, _operations_only=True)[company_id]
+                write_decision(sandbox, company_id, round_no, decision, routes)
+                result = settle_round(sandbox, round_no, _operations_only=True)[company_id]
             finally:
                 sandbox.execute("ROLLBACK TO genius_probe")
                 sandbox.execute("RELEASE genius_probe")
+            return result
+
+        def evaluate(units):
+            components = max(0, units * component_count - company["component_inventory"])
+            decision = {
+                "loan_change": loan, "worker_salary": parameters["worker_salary"],
+                "engineer_salary": parameters["engineer_salary"],
+                "management_investment": 0., "quality_investment": 0.,
+                "research_investment": float(parameters.get("research_investment", 0.)),
+                "production_volume": units,
+                "worker_delta": staff["worker"](
+                    components * settings["component_workers"] * settings["component_hours"] / 504.),
+                "engineer_delta": staff["engineer"](
+                    units * settings["product_engineers"] * settings["product_hours"] / 504.),
+            }
+            base_routes = {city: {**route, "marketing_investment": 0.}
+                           for city, route in cities.items()}
+            base_state = simulate(decision, base_routes)
+            people = max(0, int(base_state["workers"]) + int(base_state["engineers"]))
+            decision["management_investment"] = parameters["management_index"] * people
+            decision["quality_investment"] = parameters["quality_index"] * (
+                max(0, float(company["product_inventory"])) * 1.2 + units
+            )
+            planned_routes = {
+                city: {**route, "marketing_investment": route["mi_index"] * people}
+                for city, route in cities.items()
+            }
+            state = simulate(decision, planned_routes)
             routes = state["city_decisions"]
             fits = (
                 state["produced"] == units and state["cash_pre_sales"] + 1e-6 >= reserve
@@ -147,36 +191,45 @@ def plan_genius_decision(conn, company_id, round_no, parameters, cities):
                     and (route["marketing_investment"] == 0 or routes[city]["agents_after"] > 0)
                     and math.isclose(routes[city]["marketing_investment"], route["marketing_investment"],
                                      rel_tol=0, abs_tol=1e-6)
-                    for city, route in cities.items()
+                    for city, route in planned_routes.items()
                 )
             )
-            return fits, decision, state
+            return fits, decision, state, planned_routes
 
-        fits, decision, state = evaluate(0)
-        if not fits:
-            raise ValueError("固定投入、Agent 变更和现有人员费用无法在保留目标现金的同时支付。请调整参数。")
-        low, high = 0, 1
-        maximum_units = 2**31 - 1
+        low_groups, high_groups = 0, 1
+        low = 0
         while True:
-            fits, proposal, estimate = evaluate(high)
+            high = high_groups * products_per_group
+            fits, proposal, estimate, routes = evaluate(high)
             if not fits:
                 break
-            low, decision, state = high, proposal, estimate
-            if high == maximum_units:
+            low_groups = high_groups
+            low, decision, state, planned_cities = high, proposal, estimate, routes
+            if high_groups >= 2**30:
                 break
-            high = min(maximum_units, high * 2)
-        while low + 1 < high:
-            mid = (low + high) // 2
-            fits, proposal, estimate = evaluate(mid)
+            high_groups *= 2
+        while low_groups + 1 < high_groups:
+            mid_groups = (low_groups + high_groups) // 2
+            mid = mid_groups * products_per_group
+            fits, proposal, estimate, routes = evaluate(mid)
             if fits:
-                low, decision, state = mid, proposal, estimate
+                low_groups = mid_groups
+                low, decision, state, planned_cities = mid, proposal, estimate, routes
             else:
+                high_groups = mid_groups
                 high = mid
 
+        if low == 0:
+            raise ValueError("按当前工资、指数、贷款和留存现金，资金不足以完成一整组生产。请降低指数或留存金额，或调整工资和贷款。")
+
     return {
-        "decision": decision, "cities": cities, "home": home["city"],
+        "decision": decision, "cities": planned_cities, "home": home["city"],
         "patents": int(company["patents"]), "material_factor": settings["patent_factor"] ** company["patents"],
         "workers": state["workers"], "engineers": state["engineers"], "stock": state["available"],
+        "group": {"workers": group[0], "engineers": group[1], "products": group[2],
+                  "count": decision["production_volume"] // products_per_group},
+        "investments": {"ma": decision["management_investment"], "qi": decision["quality_investment"],
+                        "mi": {city: route["marketing_investment"] for city, route in planned_cities.items()}},
         "cash_before_sales": state["cash_pre_sales"],
         "cashflow": _estimate_cashflow(company, state, markets, settings, round_no, parameters["sell_through"]),
     }

@@ -1309,7 +1309,7 @@ def render_genius_decision(company, round_row, settings, markets, draft, city_va
     key = f"{prefix}genius:"
     action_key = f"player_genius_action:{company_id}:{round_no}:"
     st.subheader("天才模式")
-    st.caption(f"按 {company['home_city']} 的生产数据和本队已有专利计算。预留现金指销售收入到账前的余额。")
+    st.caption(f"按 {company['home_city']} 的KDS、库存和已获得专利自动计算。只需填写工资、指数、留存现金和贷款。")
 
     def amount(container, label, field, default=0., low=0., high=None, step=10_000.):
         value = max(float(default), low)
@@ -1318,44 +1318,48 @@ def render_genius_decision(company, round_row, settings, markets, draft, city_va
         return container.number_input(label, min_value=low, max_value=high, value=value,
                                       step=step, format="%.3f", key=f"{key}{field}")
 
+    with connect() as conn:
+        workers = int(conn.execute("SELECT COALESCE(SUM(count),0) FROM employee_cohorts WHERE company_id=? AND role='worker'",
+                                   (company_id,)).fetchone()[0])
+        engineers = int(conn.execute("SELECT COALESCE(SUM(count),0) FROM employee_cohorts WHERE company_id=? AND role='engineer'",
+                                     (company_id,)).fetchone()[0])
+    people = max(1, workers + engineers + int(draft["worker_delta"]) + int(draft["engineer_delta"]))
+    old_products = max(0., float(company["product_inventory"]))
     left, right = st.columns(2)
     parameters = {
         "worker_salary": amount(left, "工人月薪", "worker_salary", draft["worker_salary"],
                                 *worker_bounds, step=50.),
         "engineer_salary": amount(right, "工程师月薪", "engineer_salary", draft["engineer_salary"],
                                   *engineer_bounds, step=50.),
-        "management_investment": amount(left, "管理总投入（MA）", "management_investment",
-                                        draft["management_investment"]),
-        "quality_investment": amount(right, "品质总投入（QI）", "quality_investment",
-                                     draft["quality_investment"]),
-        "reserve": amount(left, "售前预留现金", "reserve"),
+        "management_index": amount(left, "MA 指数", "management_index",
+                                    draft["management_investment"] / people, step=10.),
+        "quality_index": amount(right, "QI 指数", "quality_index",
+                                draft["quality_investment"] / max(1., old_products * 1.2 + draft["production_volume"]),
+                                step=10.),
+        "reserve": amount(left, "销售前留存现金", "reserve"),
         "loan_change": amount(right, "贷款变化（负数为还款）", "loan_change", draft["loan_change"],
                               -min(float(company["cash"]), float(company["debt"])), float(loan_limit)),
-        "research_investment": amount(left, "本轮研发 / 专利投入", "research_investment",
-                                      draft["research_investment"]),
-        "sell_through": amount(right, "预计售出比例（%）", "sell_through", 80., 0., 100., step=5.),
+        "research_investment": float(draft["research_investment"]),
+        "sell_through": 80.,
     }
-    st.caption(f"新增贷款最低 ¥{minimum_loan:,.3f}。收入按假设售出比例估算，并按已开城市的市场容量分配。")
-    st.markdown("#### 各城市营销投入（MI）")
+    st.caption(f"新增贷款最低 ¥{minimum_loan:,.3f}。研发投入沿用当前草稿（¥{parameters['research_investment']:,.3f}）；现金流按售出80%估算。")
+    st.markdown("#### 各城市 MI 指数")
     cities = {}
     for market in markets:
         city = str(market["city"])
         saved = city_values[city]
-        marketing = amount(st, f"{city} MI", f"{city}:marketing", saved["marketing_investment"])
+        mi_index = amount(st, f"{city} MI 指数", f"{city}:mi_index",
+                          saved["marketing_investment"] / people, step=10.)
         current_agents = int(saved["current_agents"])
         max_add = max(0, int(settings["max_agent_add_per_city_round"]))
-        cap = min(float(settings["price_max"]), float(market["max_price"]))
-        with st.expander(f"{city} · 售价、Agent 和市场报告"):
-            agent_input = st.number_input("Agent 增减（0 为保持不变）", min_value=-current_agents,
-                                          max_value=max_add, value=max(-current_agents, min(max_add, int(saved["agent_delta"]))),
-                                          step=1, key=f"{key}{city}:agent")
-            quote = amount(st, "售价", f"{city}:price", saved["price"], float(settings["price_min"]), cap, step=50.)
-            reports = st.checkbox("购买市场报告", value=bool(saved["order_report"]), key=f"{key}{city}:report")
-        if marketing > 0 and current_agents == 0 and agent_input == 0 and max_add:
+        agent_input = max(-current_agents, min(max_add, int(saved["agent_delta"])))
+        if mi_index > 0 and current_agents + agent_input <= 0 and max_add:
             agent_input = 1
-            st.caption(f"{city} 暂无 Agent，方案会自动新增 1 个以启用 MI。")
-        cities[city] = dict(agent_delta=agent_input, marketing_investment=marketing, price=quote,
-                            order_report=int(reports))
+            st.caption(f"{city} 尚无有效 Agent，方案会自动新增 1 个以启用 MI。")
+        cities[city] = dict(agent_delta=agent_input, mi_index=mi_index,
+                            marketing_investment=0., price=saved["price"],
+                            order_report=int(saved["order_report"]))
+    st.caption("投资金额由系统反算：MA＝指数×工人和工程师人数；QI＝指数×（旧产品×1.2＋本轮产量）；每个城市的MI＝该城市指数×总用工。售价、Agent调整和市场报告沿用当前决策草稿。")
 
     signature = (round_row["starts_at"], parameters, cities)
     preview_key = f"{key}preview"
@@ -1381,6 +1385,11 @@ def render_genius_decision(company, round_row, settings, markets, draft, city_va
     columns[0].metric("计划生产", f"{plan['decision']['production_volume']:,} 件")
     columns[1].metric("预计用工", f"{plan['workers']:,} 工人 / {plan['engineers']:,} 工程师")
     columns[2].metric("预计售前现金", f"¥{plan['cash_before_sales']:,.3f}")
+    group = plan["group"]
+    st.caption(f"按KDS组成本：每组 {group['workers']} 工人＋{group['engineers']} 工程师，生产 {group['products']} 件；本方案共 {group['count']} 组。")
+    invest = plan["investments"]
+    mi_summary = "、".join(f"{city} ¥{value:,.3f}" for city, value in invest["mi"].items() if value > 0)
+    st.caption(f"自动计算投入：MA ¥{invest['ma']:,.3f} · QI ¥{invest['qi']:,.3f} · MI {mi_summary or '¥0'}")
     st.caption(f"预计可售 {plan['stock']:,} 件，假设售出 {finance['sold']:,} 件，预计期末负债 ¥{finance['debt']:,.3f}。")
     st.dataframe(pd.DataFrame(finance["rows"], columns=["项目", "现金变化", "预计余额"]),
                  hide_index=True, use_container_width=True, column_config={
