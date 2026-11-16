@@ -128,17 +128,23 @@ class PlayerDecisionDraftAppTest(unittest.TestCase):
         player = AppTest.from_file(self.app_path, default_timeout=30)
         player.session_state["auth"] = {"role": "player", "company_id": self.company_id}
         player.session_state["player_navigation"] = "决策"
+        draft_prefix = f"player_decision_draft:{self.company_id}:1:"
+        player.session_state[f"{draft_prefix}city:深圳:price"] = 12_345.0
+        player.session_state[f"{draft_prefix}city:深圳:order_report"] = True
+        player.session_state[f"{draft_prefix}research_investment"] = 50_000.0
         player.run()
         self.assertFalse(player.exception)
-        prefix = f"player_decision_draft:{self.company_id}:1:genius:"
+        prefix = f"{draft_prefix}genius:"
         action = f"player_genius_action:{self.company_id}:1:"
         player.number_input(key=f"{prefix}reserve").set_value(1_000_000.125)
         player.number_input(key=f"{prefix}management_index").set_value(123.456)
         player.number_input(key=f"{prefix}quality_index").set_value(17.25)
-        player.number_input(key=f"{prefix}深圳:mi_index").set_value(300.125)
+        player.number_input(key=f"{prefix}深圳:marketing_budget").set_value(300_000.125)
         player.button(key=f"{action}calculate").click().run()
         self.assertFalse(player.exception)
         self.assertTrue(any("49.000%" in c.value and "广州" in c.value for c in player.caption))
+        self.assertTrue(any("21 名工人、8 名工程师" in c.value and "504 个零件、72 件产品" in c.value
+                            for c in player.caption))
         finance = player.dataframe[0].value
         pre_sales = finance.loc[finance["项目"] == "售前剩余现金", "预计余额"].iloc[0]
         self.assertGreaterEqual(pre_sales, 1_000_000.125)
@@ -157,6 +163,7 @@ class PlayerDecisionDraftAppTest(unittest.TestCase):
                                     (self.company_id,))
             self.assertIsNotNone(submitted["submitted_at"])
             self.assertGreater(submitted["production_volume"], 0)
+            self.assertEqual(submitted["research_investment"], 50_000.0)
             conn.execute("UPDATE companies SET home_city='广州' WHERE id<>?", (self.company_id,))
             operations = preview_round_operations(conn, 1)[self.company_id]
             old_products = self.db.one(conn, "SELECT product_inventory FROM companies WHERE id=?",
@@ -168,9 +175,9 @@ class PlayerDecisionDraftAppTest(unittest.TestCase):
             shenzhen = self.db.one(conn, "SELECT * FROM city_decisions WHERE company_id=? AND city='深圳'",
                                    (self.company_id,))
             self.assertEqual(shenzhen["agent_delta"], 1)
-            self.assertAlmostEqual(shenzhen["marketing_investment"],
-                                   300.125 * (operations["workers"] + operations["engineers"]), places=3)
-            operations = preview_round_operations(conn, 1)[self.company_id]
+            self.assertEqual(shenzhen["price"], 12_345.0)
+            self.assertEqual(shenzhen["order_report"], 1)
+            self.assertAlmostEqual(shenzhen["marketing_investment"], 300_000.125, places=3)
             self.assertEqual(operations["produced"], submitted["production_volume"])
             self.assertAlmostEqual(operations["cash_pre_sales"], confirmed_balance, places=3)
 

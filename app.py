@@ -31,6 +31,7 @@ from sim import db as _db_module
 from sim import engine as _engine_module
 from sim import bots as _bots_module
 from sim import ai_training as _ai_training_module
+from sim import genius as _genius_module
 
 # Streamlit Community Cloud can rerun a freshly downloaded app.py inside a
 # process that still has the previous internal modules cached. Refresh only
@@ -57,6 +58,10 @@ if (
     importlib.reload(_bots_module)
     importlib.reload(importlib.import_module("sim.report_pdf"))
     importlib.reload(importlib.import_module("sim.local_launcher"))
+
+if getattr(_genius_module, "GENIUS_API_VERSION", 0) < 3:
+    importlib.invalidate_caches()
+    importlib.reload(_genius_module)
 
 from sim.bots import finalize_super_bot_decisions, submit_bot_decisions
 from sim import remote_worker as _remote_worker_module
@@ -1303,13 +1308,13 @@ def lock_player_submission(conn, company_id, viewed_round, *, require_genius=Fal
         raise ValueError("管理员已收回天才模式权限，本次提交未保存。")
 
 
-def render_genius_decision(company, round_row, settings, markets, draft, city_values,
+def render_genius_decision(company, round_row, settings, markets, draft, city_values, people,
                            worker_bounds, engineer_bounds, loan_limit, minimum_loan, prefix):
     company_id, round_no = int(company["id"]), int(round_row["round_no"])
     key = f"{prefix}genius:"
     action_key = f"player_genius_action:{company_id}:{round_no}:"
     st.subheader("天才模式")
-    st.caption(f"按 {company['home_city']} 的KDS、库存和已获得专利自动计算。只需填写工资、指数、留存现金和贷款。")
+    st.caption(f"按 {company['home_city']} 的 KDS、库存和生效专利计算。填写工资、MA/QI 指数、MI 金额、留存现金和贷款。")
 
     def amount(container, label, field, default=0., low=0., high=None, step=10_000.):
         value = max(float(default), low)
@@ -1318,12 +1323,10 @@ def render_genius_decision(company, round_row, settings, markets, draft, city_va
         return container.number_input(label, min_value=low, max_value=high, value=value,
                                       step=step, format="%.3f", key=f"{key}{field}")
 
-    with connect() as conn:
-        workers = int(conn.execute("SELECT COALESCE(SUM(count),0) FROM employee_cohorts WHERE company_id=? AND role='worker'",
-                                   (company_id,)).fetchone()[0])
-        engineers = int(conn.execute("SELECT COALESCE(SUM(count),0) FROM employee_cohorts WHERE company_id=? AND role='engineer'",
-                                     (company_id,)).fetchone()[0])
-    people = max(1, workers + engineers + int(draft["worker_delta"]) + int(draft["engineer_delta"]))
+    def draft_value(field, value):
+        return st.session_state.get(f"{prefix}{field}", value)
+
+    people = max(1, people + int(draft["worker_delta"]) + int(draft["engineer_delta"]))
     old_products = max(0., float(company["product_inventory"]))
     left, right = st.columns(2)
     parameters = {
@@ -1339,27 +1342,28 @@ def render_genius_decision(company, round_row, settings, markets, draft, city_va
         "reserve": amount(left, "销售前留存现金", "reserve"),
         "loan_change": amount(right, "贷款变化（负数为还款）", "loan_change", draft["loan_change"],
                               -min(float(company["cash"]), float(company["debt"])), float(loan_limit)),
-        "research_investment": float(draft["research_investment"]),
+        "research_investment": float(draft_value("research_investment", draft["research_investment"])),
         "sell_through": 80.,
     }
     st.caption(f"新增贷款最低 ¥{minimum_loan:,.3f}。研发投入沿用当前草稿（¥{parameters['research_investment']:,.3f}）；现金流按售出80%估算。")
-    st.markdown("#### 各城市 MI 指数")
+    st.markdown("#### 各城市 MI 投入")
     cities = {}
     for market in markets:
         city = str(market["city"])
         saved = city_values[city]
-        mi_index = amount(st, f"{city} MI 指数", f"{city}:mi_index",
-                          saved["marketing_investment"] / people, step=10.)
+        marketing = amount(st, f"{city} MI（元）", f"{city}:marketing_budget",
+                           draft_value(f"city:{city}:marketing_investment", saved["marketing_investment"]))
         current_agents = int(saved["current_agents"])
         max_add = max(0, int(settings["max_agent_add_per_city_round"]))
-        agent_input = max(-current_agents, min(max_add, int(saved["agent_delta"])))
-        if mi_index > 0 and current_agents + agent_input <= 0 and max_add:
+        agent_delta = draft_value(f"city:{city}:agent_delta", saved["agent_delta"])
+        agent_input = max(-current_agents, min(max_add, int(agent_delta)))
+        if marketing > 0 and current_agents + agent_input <= 0 and max_add:
             agent_input = 1
             st.caption(f"{city} 尚无有效 Agent，方案会自动新增 1 个以启用 MI。")
-        cities[city] = dict(agent_delta=agent_input, mi_index=mi_index,
-                            marketing_investment=0., price=saved["price"],
-                            order_report=int(saved["order_report"]))
-    st.caption("投资金额由系统反算：MA＝指数×工人和工程师人数；QI＝指数×（旧产品×1.2＋本轮产量）；每个城市的MI＝该城市指数×总用工。售价、Agent调整和市场报告沿用当前决策草稿。")
+        cities[city] = dict(agent_delta=agent_input, marketing_investment=marketing,
+                            price=draft_value(f"city:{city}:price", saved["price"]),
+                            order_report=int(draft_value(f"city:{city}:order_report", saved["order_report"])))
+    st.caption("MI 按各城市填写的金额扣除。MA＝指数×总用工，QI＝指数×（旧产品×1.2＋本轮产量）。售价、Agent 和市场报告可在普通决策中调整。")
 
     signature = (round_row["starts_at"], parameters, cities)
     preview_key = f"{key}preview"
@@ -1386,7 +1390,12 @@ def render_genius_decision(company, round_row, settings, markets, draft, city_va
     columns[1].metric("预计用工", f"{plan['workers']:,} 工人 / {plan['engineers']:,} 工程师")
     columns[2].metric("预计售前现金", f"¥{plan['cash_before_sales']:,.3f}")
     group = plan["group"]
-    st.caption(f"按KDS组成本：每组 {group['workers']} 工人＋{group['engineers']} 工程师，生产 {group['products']} 件；本方案共 {group['count']} 组。")
+    st.caption(
+        f"KDS 基准每组 {group['workers']:,} 名工人、{group['engineers']:,} 名工程师，"
+        f"对应 {group['components']:,} 个零件、{group['products']:,} 件产品。本方案共 {group['count']:,} 组。"
+    )
+    decision = plan["decision"]
+    st.caption(f"决策会填写工人增减 {decision['worker_delta']:+,}，工程师增减 {decision['engineer_delta']:+,}。")
     invest = plan["investments"]
     mi_summary = "、".join(f"{city} ¥{value:,.3f}" for city, value in invest["mi"].items() if value > 0)
     st.caption(f"自动计算投入：MA ¥{invest['ma']:,.3f} · QI ¥{invest['qi']:,.3f} · MI {mi_summary or '¥0'}")
@@ -1496,7 +1505,7 @@ def render_player_decision(company: sqlite3.Row) -> None:
         st.session_state.setdefault(genius_key, True)
         if st.toggle("使用天才模式", key=genius_key):
             render_genius_decision(
-                company, round_row, settings, markets, decision, city_values,
+                company, round_row, settings, markets, decision, city_values, current_workers + current_engineers,
                 (worker_salary_low, worker_salary_high), (engineer_salary_low, engineer_salary_high),
                 loan_limit, minimum_new_loan, widget_prefix,
             )
