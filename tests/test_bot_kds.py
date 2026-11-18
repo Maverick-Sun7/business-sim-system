@@ -451,8 +451,8 @@ class BotKDSRegressionTest(unittest.TestCase):
         bot_id = self.company("BOT", ordinary=True, cash=300_000_000)
         self.db.set_setting(self.conn, "total_rounds", 10)
         self.conn.execute("INSERT INTO rounds(round_no,status) VALUES(7,'open')")
-        # R7 wants at least four agents in each initially empty city. This
-        # catches both an old hard-coded 3 and a mistaken global per-round cap.
+        # Super bots want at least four in each city here. Ordinary bots may
+        # open more than one city but must size additions to each route's payoff.
         for super_mode in (False, True):
             self.conn.execute(
                 "UPDATE companies SET is_super_bot=? WHERE id=?", (int(super_mode), bot_id),
@@ -473,7 +473,9 @@ class BotKDSRegressionTest(unittest.TestCase):
                     )]
                     self.assertEqual(len(additions), 2)
                     self.assertTrue(all(0 <= delta <= limit for delta in additions), additions)
-                    if limit <= 1:
+                    if not super_mode:
+                        self.assertEqual(any(additions), limit > 0)
+                    elif limit <= 1:
                         self.assertEqual(additions, [limit, limit])
                     else:
                         self.assertTrue(all(delta > 3 for delta in additions), additions)

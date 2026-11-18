@@ -4582,7 +4582,9 @@ def _submit_bots(
 
 def submit_bot_decisions(conn: sqlite3.Connection, round_no: int) -> int:
     """Ordinary bots submit immediately when a round opens."""
-    return _submit_bots(conn, round_no, False)
+    from .ordinary_bots import submit_ordinary_decisions
+
+    return submit_ordinary_decisions(conn, round_no)
 
 
 def _submit_super_bot_decisions_locked(
