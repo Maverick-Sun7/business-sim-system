@@ -129,6 +129,7 @@ from sim.ai_training import (
     set_ai_training_enabled,
 )
 from sim.defaults import GLOBAL_SETTING_LABELS, MARKET_COLUMNS
+from sim.chart_palette import wealth_color_range
 from sim.engine import available_loan_limit, current_company_net_assets, loan_ceiling_for_round, market_size, settle_round, weighted_market_average
 from sim.report_pdf import build_round_report_pdf
 from sim.finance import asset_reconciliation, build_finance_ledger
@@ -1975,13 +1976,15 @@ def render_wealth(company: sqlite3.Row | None, admin: bool = False) -> None:
     max_round = int(frame["轮次"].max())
     latest = frame.sort_values("轮次").groupby("队伍", as_index=False).tail(1).sort_values("净资产", ascending=False)
     ranking_order = latest["队伍"].tolist()
+    team_order = [f"{item['code']} · {item['name']}" for item in companies]
     chart = (
         alt.Chart(frame)
         .mark_line(point=alt.OverlayMarkDef(size=58), strokeWidth=2.2)
         .encode(
             x=alt.X("轮次:Q", title="Round", scale=alt.Scale(domain=[0, max_round], nice=False), axis=alt.Axis(values=list(range(0, max_round + 1)), tickMinStep=1)),
             y=alt.Y("净资产:Q", title="Net Assets (RMB)", scale=alt.Scale(zero=False), axis=alt.Axis(format=",")),
-            color=alt.Color("队伍:N", title=None, sort=ranking_order, legend=alt.Legend(orient="right")),
+            color=alt.Color("队伍:N", title=None, sort=ranking_order, legend=alt.Legend(orient="right"),
+                            scale=alt.Scale(domain=ranking_order, range=wealth_color_range(team_order, ranking_order))),
             tooltip=[alt.Tooltip("队伍:N"), alt.Tooltip("轮次:Q", format=".0f"), alt.Tooltip("净资产:Q", format=",.0f")],
         )
         .properties(height=520, title="Chart for Simulation")

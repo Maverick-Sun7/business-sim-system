@@ -102,6 +102,26 @@ def _fund(batch, cash, target, budget):
     return budget(low * batch)
 
 
+def _market_pressure(latest_fill, older_fill):
+    # A recently full city does not become an expansion market after one soft round.
+    return max(0., min(1., (max(latest_fill, older_fill * .97) - .90) / .10))
+
+
+def _production_sale_credit(prediction, routes, markets):
+    credit = 0.
+    for city in routes:
+        sold = prediction['sold_units'][city]
+        primary = min(sold, prediction['primary'][city])
+        # Forecast secondary orders still count, but when a city is full they
+        # can disappear as competitors liquidate stock or change their bids.
+        credit += primary + (sold - primary) * (1. - .40 * markets[city]['production_pressure'])
+    return credit
+
+
+def _new_production_target(sale_credit, old_stock):
+    return max(0, math.floor(sale_credit) - old_stock)
+
+
 def _build_plan(bot, slot, settings, group, markets, previous, last_routes, agents, cohorts, traffic, field_size, round_no):
     key = int(bot['id'])
     home_city = str(bot['home_city'] or next(iter(markets)))
@@ -287,7 +307,12 @@ def _build_plan(bot, slot, settings, group, markets, previous, last_routes, agen
                       workers + engineers - worker_quits - engineer_quits, materials)
 
     demand = sum(route.demand for route in active.values())
-    group_limit = max(0, int(demand * (1.65 if contest < .78 else 1.32)) - old_products)
+    headroom = 1.65 if contest < .78 else 1.32
+    supply_goal = sum(
+        route.demand * (headroom - (headroom - 1.05) * markets[city]['production_pressure'])
+        for city, route in active.items()
+    )
+    group_limit = _new_production_target(supply_goal, old_products)
     if field_size <= 2 and active and not (contest >= .82 or distressed):
         group_limit = max(group_limit, min(int(demand * 2), int(cash / max(1., base_unit_cost))))
     if distressed:
@@ -333,10 +358,14 @@ def submit_ordinary_decisions(conn: sqlite3.Connection, round_no: int) -> int:
     last_routes = {(int(row['company_id']), str(row['city'])): dict(row) for row in conn.execute(
         'SELECT company_id,city,sold,price,marketing FROM city_results WHERE round_no=?', (prior,)
     )}
-    stats = {str(row['city']): row for row in conn.execute(
-        'SELECT * FROM market_round_stats WHERE round_no=(SELECT MAX(round_no) FROM market_round_stats WHERE round_no>=1 AND round_no<?)',
+    stats = defaultdict(list)
+    for row in conn.execute(
+        'SELECT city,market_size,player_total_volume,average_price FROM market_round_stats WHERE round_no IN '
+        '(SELECT DISTINCT round_no FROM market_round_stats WHERE round_no>=1 AND round_no<? ORDER BY round_no DESC LIMIT 2) '
+        'ORDER BY round_no DESC',
         (round_no,),
-    )}
+    ):
+        stats[str(row['city'])].append(row)
     pool_totals = defaultdict(lambda: [0., 0., 0., 0])
     agents = {(int(row['company_id']), str(row['city'])): int(row['count']) for row in conn.execute('SELECT * FROM agents')}
     homes = Counter(str(row['home_city']) for row in conn.execute('SELECT home_city FROM companies'))
@@ -350,11 +379,14 @@ def submit_ordinary_decisions(conn: sqlite3.Connection, round_no: int) -> int:
         pools[2] += weight * route['marketing'] * agent_mi_benefit(agents.get((company_id, city), 0))
         pools[3] += weight
     for city, market in markets.items():
-        stat = stats.get(city)
+        history = stats[city]
+        stat = history[0] if history else None
+        fills = [min(1., row['player_total_volume'] / max(1., row['market_size'])) for row in history]
+        fill, older_fill = (fills + [0., 0.])[:2]
         size = market_size(market, round_no, float(settings['market_growth']))
         ma, qi, mi, weight = pool_totals[city]
         market.update(market_size=size, base_average_price=float(stat['average_price'] if stat else market['initial_avg_price']),
-                      fill=min(1., float(stat['player_total_volume']) / max(1., float(stat['market_size']))) if stat else 0.,
+                      fill=fill, production_pressure=_market_pressure(fill, older_fill),
                       pool_indices=(ma / max(1., weight), qi / max(1., weight), mi / max(1., weight)), mi_active=mi > 0.)
         traffic[city] = max(traffic[city], homes[city])
     cohorts = defaultdict(list)
@@ -399,11 +431,15 @@ def submit_ordinary_decisions(conn: sqlite3.Connection, round_no: int) -> int:
         sold = estimate['sold_total']
         expected_revenue = sum(count * routes[city].net_price for city, count in estimate['sold_units'].items() if city in routes)
         capacity = estimate['visible_total']
+        target = budget.units
         if budget.units and (field_size > 2 or contest >= .82 or stock) and sold < (stock + budget.units) * .90:
             times = 1.10 if contest < .78 and expected_revenue >= budget.cost else 1.02
             if expected_revenue < budget.cost:
                 times = .92
             target = max(0, min(budget.units, math.ceil(max(sold, min(capacity, sold * 1.24)) * times - stock)))
+        if budget.units and any(markets[city]['production_pressure'] > 0 for city in routes):
+            target = min(target, _new_production_target(_production_sale_credit(estimate, routes, markets), stock))
+        if target < budget.units:
             budget = _fund(batch, cash, target, build_budget)
         available = stock + budget.units
         revenue = expected_revenue * min(1., available / max(1., sold))

@@ -1,10 +1,14 @@
 import json
 from unittest.mock import patch
 
+import pytest
+
 from sim import db
 from sim.bots import submit_bot_decisions
 from sim.engine import settle_round
-from sim.ordinary_bots import _group, forecast_market_sales
+from sim.ordinary_bots import (
+    _group, _market_pressure, _new_production_target, _production_sale_credit, forecast_market_sales,
+)
 
 
 def _seed(tmp_path, monkeypatch, count):
@@ -33,6 +37,19 @@ def test_group_is_derived_from_the_current_recipe():
     case.update(component_workers=6, component_hours=4, components_per_product=5, product_engineers=3, product_hours=24)
     parts, workers_per_product, engineers_per_product, products = _group(case)
     assert (round(workers_per_product * products), round(engineers_per_product * products), parts * products, products) == (5, 3, 105, 21)
+
+
+def test_recent_capacity_pressure_only_discounts_secondary_sales_in_the_full_city():
+    pressure = _market_pressure(.82, 1.)
+    assert pressure == pytest.approx(.7)
+    assert _market_pressure(.82, .85) == 0.
+    assert _market_pressure(1., .85) == pytest.approx(1.)
+    markets = {'full': {'production_pressure': pressure}, 'open': {'production_pressure': 0.}}
+    forecast = {'sold_units': {'full': 100, 'open': 100}, 'primary': {'full': 50., 'open': 30.}}
+    sale_credit = _production_sale_credit(forecast, ('full', 'open'), markets)
+    assert sale_credit == pytest.approx(186.)
+    assert _new_production_target(sale_credit, 100) == 86
+    assert _new_production_target(sale_credit, 190) == 0
 
 
 def test_ordinary_investments_do_not_depend_on_random_match_seed(tmp_path, monkeypatch):
