@@ -146,12 +146,16 @@ class SuperBotActualBudgetTest(unittest.TestCase):
         )
         company_id = int(cursor.lastrowid)
         original_selector = self.bots._select_empirical_super_candidate
-        chosen_ratios = []
+        chosen_quotes = []
 
         def undercut(*args, **kwargs):
-            candidate = dict(original_selector(*args, **kwargs))
-            candidate["price_ratio"] = 0.25
-            chosen_ratios.append(candidate["price_ratio"])
+            forecasts = [row for row in args[0] if "广州" in row.get("resolved_city_prices", {})]
+            if not forecasts:
+                return original_selector(*args, **kwargs)
+            candidate = dict(min(forecasts, key=lambda row: row["resolved_city_prices"]["广州"]))
+            chosen_quotes.append(candidate["resolved_city_prices"]["广州"])
+            # A coarse search label must not override the exact city quote.
+            candidate["price_ratio"] = 1.
             return candidate
 
         with patch.object(self.bots, "_select_empirical_super_candidate", side_effect=undercut):
@@ -163,8 +167,8 @@ class SuperBotActualBudgetTest(unittest.TestCase):
             + 7 * 3 * 7 / 504 * float(decision["worker_salary"]) * 3
             + 4 * 14 / 504 * float(decision["engineer_salary"]) * 3
         )
-        expected = max(3500, chosen_ratios[0] * 25000, direct_cost * 1.03)
-        self.assertAlmostEqual(float(city["price"]), expected)
+        self.assertAlmostEqual(float(city["price"]), chosen_quotes[-1])
+        self.assertGreaterEqual(float(city["price"]) + .005, max(3500, direct_cost * 1.03))
         self.assertLess(float(city["price"]), 25000 * 0.75)
 
 

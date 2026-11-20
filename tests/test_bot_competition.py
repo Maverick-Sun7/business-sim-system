@@ -24,6 +24,48 @@ class BotCompetitionTest(unittest.TestCase):
 
         self.bots = bots
 
+    def test_city_bid_options_probe_small_discounts_and_different_team_quotes(self):
+        def options(seed, rival_price=19_000, rival_mi=600_000, agents=2, allow_low=True):
+            return self.bots._super_city_bid_options(
+                quote=19_000, cap=25_000, minimum=3_500, average=20_000,
+                price_power=20, allow_low=allow_low, threshold=100_000,
+                rivals=[{"price": rival_price, "mi_effective": rival_mi}],
+                agents=agents, seed=seed,
+            )
+
+        first = options(33)
+        self.assertEqual(first[:2], (18_900, 18_800))
+        self.assertEqual(first, options(33))
+        self.assertNotEqual(first[:2], options(39)[:2])
+        self.assertLess(options(33, rival_price=17_000)[1], first[1])
+        self.assertLess(options(33, agents=5)[5], first[5])
+        self.assertGreater(options(33, rival_mi=1_200_000)[5], first[5])
+        self.assertGreaterEqual(options(33, rival_price=6_000, allow_low=False)[3], 18_750)
+
+    def test_investment_overbid_can_cross_the_rival_index_and_old_cap(self):
+        self.assertGreater(self.bots._super_index_overbid(1300, 2500, [2500], 1.6), 2500)
+        self.assertGreater(self.bots._super_index_overbid(1300, 5000, [9000]), 8000)
+
+    def test_small_price_step_changes_investment_cpi_as_well_as_price_cpi(self):
+        def cpi(price):
+            entries = [
+                {"company_id": 1, "ma_index": 3500, "qi_index": 1100,
+                 "mi_investment": 4_000_000, "agents": 3, "price": price},
+                {"company_id": 2, "ma_index": 3500, "qi_index": 1100,
+                 "mi_investment": 4_000_000, "agents": 3, "price": 19_000},
+            ]
+            rules = {"market_size": 100_000, "max_price": 25_000, "ma_large_threshold": 1300}
+            averages = self.bots.investment_average_prices(entries, [2000, 4000], fallback=20_000, **rules)
+            return self.bots.allocate_city_cpi(
+                entries, **rules, average_price=averages, market_average_price=20_000, price_power=20,
+            )[0]
+
+        equal, small, larger = [cpi(price) for price in (19_000, 18_900, 18_800)]
+        for pool in ("ma_cpi", "qi_cpi", "mi_cpi", "price_cpi"):
+            with self.subTest(pool=pool):
+                self.assertLess(equal[pool], small[pool])
+                self.assertLess(small[pool], larger[pool])
+
     def test_target_priority_preserves_team_and_rank_order(self):
         cases = (
             ("higher human", True, False, 1, 0.0, 5),

@@ -28,7 +28,7 @@ from .engine import (
 )
 
 
-BOT_API_VERSION = 40
+BOT_API_VERSION = 42
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 _FORECAST_POOL_LOCK = threading.Lock()
 _FORECAST_POOL: ProcessPoolExecutor | None = None
@@ -819,6 +819,40 @@ def _upper_typical(values: list[float]) -> float:
     return clean[min(len(clean) - 1, math.floor((len(clean) - 1) * 0.80))]
 
 
+def _super_index_overbid(threshold, own, rivals, stretch=1.25):
+    active = [float(value) for value in rivals if value > 0.0]
+    field = max(threshold, _upper_typical(active))
+    # The CPI curve prices the marginal return; the strategy may still cross
+    # the bend when the extra units sold pay for the higher investment.
+    return max(own * stretch, field * stretch, field + threshold * .1)
+
+
+def _super_city_bid_options(*, quote, cap, minimum, average, price_power, allow_low,
+                            rivals, threshold, agents, seed):
+    quotes = sorted(float(row["price"]) for row in rivals if row["price"] > 0)
+    active_mi = [row["mi_effective"] for row in rivals if row["mi_effective"] > 0]
+    local_bid = _upper_typical(active_mi) / (1.0 + .1 * agents)
+    # Stable variation per team, round and city; rerunning a decision is deterministic.
+    offset = (seed % 67) - 33
+    anchor = min(cap, quotes[len(quotes) // 2] if quotes else average)
+    def bound(value):
+        return round(min(cap, max(minimum, value)), 2)
+
+    # Small markdowns stay available even where deep discounting is locked.
+    mild_floor = minimum if allow_low else max(minimum, .75 * cap)
+    mild = bound(max(mild_floor, quote - (100 + offset)))
+    medium = bound(max(mild_floor, min(quote, anchor) - (200 - offset)))
+    premium = bound(max(quote, min(cap - max(1., 110 + offset), anchor + 150 - offset)))
+    deep = medium
+    if allow_low:
+        rival_low = quotes[(len(quotes) - 1) // 4] if quotes else average
+        weight_quote = _price_for_weight_advantage(average, rival_low, minimum, price_power, 1.2)
+        deep = bound(min(medium, rival_low - (100 + offset), weight_quote))
+    return mild, medium, premium, deep, max(threshold * .32, local_bid * .65), max(
+        threshold * 1.12, local_bid * (1.20 + (seed % 23) / 100),
+    )
+
+
 def _balanced_production_group(
     component_workers: float,
     component_hours: float,
@@ -864,6 +898,28 @@ def _affordable_group_count(
     cash_after_fixed = max(0.0, float(available_cash) - max(0.0, float(fixed_agent_and_mi)))
     affordable = math.floor(cash_after_fixed / max(float(complete_group_cost), 1.0))
     return max(0, min(int(affordable), max(0, int(demand_groups))))
+
+
+def _max_budgeted_groups(available_cash, group_products, estimate, budget_for):
+    """Find the affordable whole-group limit using payroll and storage costs."""
+    low, high = 0, max(1, estimate)
+    best = budget_for(0)
+    if best["total"] > available_cash + 1e-9:
+        return -1, best
+    # Check zero separately: a stock-only MA plan can keep one employee.
+    while True:
+        budget = budget_for(math.floor(high * group_products))
+        if budget["total"] > available_cash + 1e-9:
+            break
+        low, high, best = high, high * 2, budget
+    while low + 1 < high:
+        middle = (low + high) // 2
+        budget = budget_for(math.floor(middle * group_products))
+        if budget["total"] <= available_cash + 1e-9:
+            low, best = middle, budget
+        else:
+            high = middle
+    return low, best
 
 
 def _kds_price_depth(base_depth: float, price_power: int) -> float:
@@ -3341,27 +3397,9 @@ def _submit_bots(
                 force_full_output: bool = False,
                 mi_focus: tuple[int, ...] | None = None,
             ) -> dict[str, Any]:
-                pure_price_route = bool(
-                    candidate_ma <= 1.00000001
-                    and candidate_qi <= 1.00000001
-                    and candidate_mi_ratio <= 1e-12
-                )
-                resolved_mi_ratio = candidate_mi_ratio
-                if super_mode and use_mi and not pure_price_route:
-                    # MA/QI naturally compound as the field invests more. MI is
-                    # city-specific, so enforce the same progression separately
-                    # in every opened city. Only a true pure-price route may use
-                    # zero MI; there is no half-open MI strategy.
-                    mi_phase_floor = min(
-                        mi_ratio_ceiling,
-                        1.02
-                        + max(0, plan_index - 2) * 0.55
-                        + (sequence_strength - 1.0) * 2.0,
-                    )
-                    resolved_mi_ratio = max(resolved_mi_ratio, mi_phase_floor)
                 candidate_marketing = {
                     index: (
-                        mi_thresholds.get(index, 0.0) * resolved_mi_ratio
+                        mi_thresholds.get(index, 0.0) * candidate_mi_ratio
                         if index in mi_selected and agent_plan[index][1] > 0
                         and (mi_focus is None or index in mi_focus) else 0.0
                     )
@@ -3673,6 +3711,10 @@ def _submit_bots(
                     if expansion_room:
                         test_candidate(1.0, 0.0, 0.0, candidate_price_ratio, force_full_output=True)
                 if use_mi and mi_selected:
+                    # The old spending shape remains an option, not a floor.
+                    phase_bid = min(mi_ratio_ceiling, 1.02 + max(0, plan_index - 2) * .55
+                                    + (sequence_strength - 1.0) * 2.0)
+                    test_candidate(field_ma, field_qi, max(0., phase_bid), candidate_price_ratio)
                     # Concentrated MI is compared with broad MI; it is never
                     # forced to pay the large threshold in every open city.
                     for focus_count in sorted({1, min(3, len(focus_order))}):
@@ -4164,13 +4206,10 @@ def _submit_bots(
                                 ),
                             ),
                         }
-                    # Preserve prices of plans with different quotes by city.
-                    # Plain ratio-based candidates are rebuilt at save time.
-                    if late_disruptor or candidate.get("rival_seed") or candidate.get("expansion_probe"):
-                        candidate["resolved_city_prices"] = {
-                            city: float(data["price"])
-                            for city, data in own_cities.items()
-                        }
+                    # The submitted city prices must match the settled forecast.
+                    candidate["resolved_city_prices"] = {
+                        city: float(data["price"]) for city, data in own_cities.items()
+                    }
                     players = [
                         *rival_player_list,
                         {"company_id": company_id, "available": candidate_available,
@@ -4202,6 +4241,7 @@ def _submit_bots(
                 def score_exact(prepared, after_forecast):
                     candidate, own_cities, candidate_available, actual_budget = prepared
                     own_forecast = after_forecast["companies"][company_id]
+                    candidate["forecast_city_sold"] = own_forecast["sold_units"]
                     # Secondary allocation is part of the plan, but an early
                     # sequential Super Bot cannot assume every synthetic peer
                     # will leave that pool untouched. Confidence rises to 100%
@@ -4247,6 +4287,136 @@ def _submit_bots(
                 # second pass, so every refinement gets a fresh full forecast.
                 refinements = []
                 refinement_keys = set()
+                full_group_budgets = {}
+                if prepared_finalists and candidate_city_data and not late_disruptor:
+                    # Compare city-specific prices and bids using the same
+                    # exact settlement as the existing uniform grid.
+                    bid_cities = candidate_city_data
+                    field = {entry["company_id"]: entry for row in bid_cities for entry in row[6][:-1]}
+                    stretch = 1.22 + (company_id % 11) * .025
+                    over_ma = _super_index_overbid(ma_threshold, 0., [r["ma_index"] for r in field.values()], stretch)
+                    over_qi = _super_index_overbid(qi_line, 0., [r["qi_index"] for r in field.values()], stretch)
+                    priority = sorted(bid_cities, key=lambda row: (
+                        baseline_city_sales.get(str(markets[row[0]]["city"]), 0.) - row[7] * 1.12,
+                        (row[0] - company_id) % len(markets),
+                    ))
+                    focus_count = 3 if len(priority) > 4 else 2
+                    focus = {row[0] for row in priority[:focus_count]}
+                    ranked = sorted(prepared_finalists, key=lambda p: (p[0]["predicted_profit"], p[0]["risk_profit"]), reverse=True)
+                    seeds = [ranked[0]]
+                    premium_seed = next((p for p in ranked if any(
+                        p[1][str(markets[i]["city"])]["price"] >= cap * .80 for i, cap, *_ in bid_cities)), None)
+                    growth_seed = max(ranked, key=lambda p: (
+                        p[0]["predicted_profit"] + .10 * p[0]["predicted_revenue"]
+                        if p[0]["sell_ratio"] >= .78 else float("-inf"), p[2],
+                    ))
+                    for seed in (premium_seed, growth_seed):
+                        if seed is not None and all(seed[0] is not item[0] for item in seeds):
+                            seeds.append(seed)
+
+                    for candidate, cities, _, _ in seeds:
+                        options = {}
+                        for index, cap, unlocked, direct_cost, *_ in bid_cities:
+                            city = str(markets[index]["city"])
+                            options[index] = _super_city_bid_options(
+                                quote=cities[city]["price"], cap=cap,
+                                minimum=max(price_min, direct_cost * 1.03),
+                                average=previous_prices[index], price_power=price_power,
+                                allow_low=unlocked, rivals=rival_metrics[index],
+                                threshold=mi_thresholds[index], agents=cities[city]["agents"],
+                                seed=company_id * 137 + index * 41 + official_round * 59,
+                            )
+                        base_ma, base_qi = float(candidate["ma"]), float(candidate["qi"])
+                        variants = [
+                            ("mild", base_ma, base_qi, 1.), ("discount", base_ma, base_qi, 1.25),
+                            ("price_only", 0., 0., 1.42),
+                            ("lean", ma_threshold * (.12 + (company_id % 7) * .025),
+                             qi_line * .22 if use_qi else 0., 1.35),
+                            ("ma_push", max(base_ma * stretch, over_ma), base_qi, 1.13),
+                        ]
+                        if use_qi:
+                            variants.append(("qi_push", base_ma, max(base_qi * stretch, over_qi), 1.13))
+                        if plan_index >= 2:
+                            variants.extend((
+                                ("mi_push", base_ma, base_qi, 1.14),
+                                ("mi_trim", base_ma, base_qi, 1.25),
+                                ("mi_shift", base_ma, base_qi, 1.05),
+                                ("mi_discount", min(base_ma, ma_threshold), min(base_qi, qi_line), 1.30),
+                                ("mixed_push", max(base_ma * 1.12, over_ma),
+                                 max(base_qi * 1.12, over_qi) if use_qi else 0., 1.10),
+                            ))
+                        # Move some existing MI from low-converting cities to
+                        # promising ones without raising total MI spend.
+                        city_sales = candidate["forecast_city_sold"]
+                        mi_order = sorted(priority, key=lambda row: (
+                            -city_sales.get(str(markets[row[0]]["city"]), 0.)
+                            * cities[str(markets[row[0]]["city"])]["price"]
+                            / max(1., cities[str(markets[row[0]]["city"])]["marketing"] + mi_thresholds[row[0]] * .35),
+                        ))
+                        mi_receivers = {row[0] for row in mi_order[:focus_count]}
+                        mi_donations = {
+                            i: cities[str(markets[i]["city"])]["marketing"] * .35
+                            for i in options if i not in mi_receivers
+                        }
+                        mi_reassigned = sum(mi_donations.values())
+                        if not mi_reassigned:
+                            variants = [variant for variant in variants if variant[0] != "mi_shift"]
+                        for kind, ma, qi, scale in variants:
+                            revised = {city: dict(route) for city, route in cities.items()}
+                            for i, (mild, medium, premium, deep, small, strong) in options.items():
+                                route = revised[str(markets[i]["city"])]
+                                focused = i in focus
+                                if kind == "mild":
+                                    route["price"] = mild
+                                elif kind == "discount":
+                                    route["price"] = medium if focused else mild
+                                elif kind == "price_only":
+                                    route.update(price=deep if focused else medium, marketing=0.)
+                                elif kind == "mi_trim":
+                                    # A small markdown may replace expensive MI;
+                                    # keep only the more relevant local bids.
+                                    route["price"] = mild if route["marketing"] else route["price"]
+                                    route["marketing"] = min(route["marketing"], small) if focused else route["marketing"] * .65
+                                elif kind == "mi_shift":
+                                    if i in mi_receivers:
+                                        route["marketing"] += mi_reassigned / len(mi_receivers)
+                                    else:
+                                        route["marketing"] -= mi_donations[i]
+                                        route["price"] = mild
+                                elif kind in {"lean", "mi_discount"}:
+                                    deep_mix = kind == "mi_discount"
+                                    route["price"] = (deep if deep_mix else medium) if focused else mild
+                                    allowance = cash_budget * (.27 if deep_mix else .09) / max(1, len(focus))
+                                    route["marketing"] = min(strong if deep_mix else small, allowance) if focused and plan_index >= 2 else 0.
+                                else:
+                                    route["price"] = premium if focused else route["price"]
+                                    if kind in {"mi_push", "mixed_push"} and focused:
+                                        bid = max(strong, route["marketing"] * stretch)
+                                        route["marketing"] = max(route["marketing"], min(bid, cash_budget * .32 / max(1, len(focus))))
+
+                            marketing = {i: revised[str(markets[i]["city"])]["marketing"] for i in options}
+                            ma_index_target, qi_index_target, marketing_targets = ma, qi, marketing
+                            budget_key = (ma, qi, tuple(sorted(marketing.items())))
+                            if budget_key not in full_group_budgets:
+                                full_group_budgets[budget_key] = _max_budgeted_groups(
+                                    cash_budget, group["products"], max(candidate["groups"], formula_groups), budget_for,
+                                )
+                            limit, max_budget = full_group_budgets[budget_key]
+                            groups_to_try = {min(max(1, math.ceil(candidate["groups"] * scale)), limit)}
+                            if kind in {"discount", "price_only", "lean", "mi_trim", "mi_discount", "mixed_push"}:
+                                groups_to_try.add(limit)
+                            prices = {city: route["price"] for city, route in revised.items()}
+                            for count in sorted(groups_to_try):
+                                key = ("city_bid", budget_key, count, tuple(prices.items()))
+                                if count < 0 or (not count and not old_products) or key in refinement_keys:
+                                    continue
+                                refinement_keys.add(key)
+                                output = math.floor(count * group["products"])
+                                refinements.append(({
+                                    **candidate, "ma": ma, "qi": qi, "groups": count,
+                                    "marketing": marketing, "marketing_total": sum(marketing.values()),
+                                    "resolved_city_prices": prices, "budget_max_output": count == limit,
+                                }, revised, old_products + output, max_budget if count == limit else budget_for(output)))
                 expand_late = (not late_disruptor and not competitive_mode
                                and official_round >= max(4, math.ceil(total_rounds * .60)))
                 if expand_late:
@@ -4478,8 +4648,8 @@ def _submit_bots(
                     False,
                     float(best_candidate["price_ratio"]),
                 )
-                # Keep city-specific bids exactly as tested. Ordinary uniform
-                # candidates still follow their finally selected ratio.
+                # Keep each city price exactly as tested, for both uniform
+                # and differentiated candidates.
                 resolved_city_prices = best_candidate.get("resolved_city_prices", {})
                 if resolved_city_prices:
                     for city_row in city_rows:
