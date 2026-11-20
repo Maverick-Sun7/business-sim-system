@@ -28,7 +28,7 @@ from .engine import (
 )
 
 
-BOT_API_VERSION = 42
+BOT_API_VERSION = 43
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 _FORECAST_POOL_LOCK = threading.Lock()
 _FORECAST_POOL: ProcessPoolExecutor | None = None
@@ -946,6 +946,38 @@ def _price_for_weight_advantage(
         return max(float(price_floor), min(average, float(rival_price)))
     target_gap = rival_gap * max(1.0, float(weight_multiplier)) ** (1.0 / max(1, int(price_power)))
     return max(float(price_floor), average - target_gap)
+
+
+def _super_low_pool_quote(*, average, cap, minimum, rivals, price_power,
+                          weight_share, seed, rival_depth=1.):
+    """Bid for the city's price pool, using its actual entry line and rivals."""
+    floor = math.ceil(minimum * 100) / 100
+    ceiling = min(math.floor(cap * 100), math.ceil(average * 100) - 1) / 100
+    if ceiling < floor:
+        return None
+    power = max(1, price_power)
+    gaps = [average - row["price"] for row in rivals if 0 < row["price"] < average]
+    # Normalize before exponentiation so unusual KDS powers are safe.
+    largest = max(gaps, default=0.)
+    weight_gap = largest * (weight_share * sum((gap / largest) ** power for gap in gaps)) ** (1 / power)
+    depth = 75 + seed % 113
+    return round(max(floor, min(ceiling, average - max(depth, weight_gap * rival_depth))), 2)
+
+
+def _super_low_pool_subsets(city_options, target_units):
+    """Try focused discounts and the smallest set that can cover the gap."""
+    ordered = sorted(city_options, key=lambda row: (-row[1], -row[2]))
+    if not ordered:
+        return ()
+    limit = len(ordered) if len(ordered) == 1 else len(ordered) - 1
+    cover, count = 0., 0
+    for _, units, _ in ordered[:limit]:
+        cover += units
+        count += 1
+        if cover >= target_units:
+            break
+    counts = dict.fromkeys((1, count, min(limit, max(2, len(ordered) // 2))))
+    return tuple(frozenset(row[0] for row in ordered[:n]) for n in counts)
 
 
 def _all_markets_near_capacity(
@@ -4114,6 +4146,47 @@ def _submit_bots(
                                 probe = {**row, "groups": max(1, round(max_groups * part))}
                                 shortlisted[id(probe)] = probe
                 saved_targets = ma_index_target, qi_index_target, marketing_targets
+                if not late_disruptor:
+                    # Give every Super Bot (including the first in the queue)
+                    # untrimmed, genuinely price-only candidates. The coarse
+                    # primary-CPI estimate cannot size a secondary-sale play.
+                    floors = {
+                        i: max(price_min, direct_cost * 1.03)
+                        for i, _, _, direct_cost, *_ in candidate_city_data
+                    }
+                    pure = None
+                    seen_quotes = set()
+                    for depth, strength in ((.34, .55), (.63, .80), (1., 1.45)):
+                        quotes = {}
+                        for i, cap, unlocked, *_ in candidate_city_data:
+                            if not unlocked:
+                                continue
+                            seed = company_id * 137 + i * 41 + official_round * 59
+                            quote = _super_low_pool_quote(
+                                average=previous_prices[i], cap=cap, minimum=floors[i],
+                                rivals=rival_metrics[i], price_power=price_power,
+                                weight_share=strength * (.85 + (seed % 37) / 100),
+                                seed=seed, rival_depth=depth,
+                            )
+                            if quote is not None:
+                                quotes[str(markets[i]["city"])] = quote
+                        quote_key = tuple(quotes.items())
+                        if not quote_key or quote_key in seen_quotes:
+                            continue
+                        seen_quotes.add(quote_key)
+                        if pure is None:
+                            pure = evaluate_candidate(0., 0., 0., .90, True, ())
+                            ma_index_target, qi_index_target, marketing_targets = 0., 0., pure["marketing"]
+                            pure_limit, _ = _max_budgeted_groups(
+                                cash_budget, group["products"], pure["groups"], budget_for,
+                            )
+                            ma_index_target, qi_index_target, marketing_targets = saved_targets
+                        if pure_limit < 0 or (not pure_limit and not old_products):
+                            break
+                        for count in sorted({pure_limit, round(pure_limit * .65)}):
+                            row = {**pure, "groups": count, "forecast_prices": quotes,
+                                   "low_pool_probe": True, "lean_secondary_route": True}
+                            shortlisted[id(row)] = row
                 rival_player_list = list(rival_players.values())
                 prepared_finalists: list[tuple[
                     dict[str, Any], dict[str, Any], int, dict[str, Any]
@@ -4242,6 +4315,11 @@ def _submit_bots(
                     candidate, own_cities, candidate_available, actual_budget = prepared
                     own_forecast = after_forecast["companies"][company_id]
                     candidate["forecast_city_sold"] = own_forecast["sold_units"]
+                    if candidate.get("low_pool_probe"):
+                        candidate["low_pool_capacity"] = {
+                            city: max(float(own_forecast["price"][city]), float(own_forecast["sold_units"][city]))
+                            for city in candidate["forecast_prices"]
+                        }
                     # Secondary allocation is part of the plan, but an early
                     # sequential Super Bot cannot assume every synthetic peer
                     # will leave that pool untouched. Confidence rises to 100%
@@ -4313,6 +4391,76 @@ def _submit_bots(
                     for seed in (premium_seed, growth_seed):
                         if seed is not None and all(seed[0] is not item[0] for item in seeds):
                             seeds.append(seed)
+
+                    low_seed = next((p for p in ranked if p[0].get("low_pool_probe")), None)
+                    if low_seed is not None and len(bid_cities) > 1:
+                        low, low_routes, available, _ = low_seed
+                        # Use actual price-pool/secondary capacity to concentrate
+                        # discounts. Empty headroom in another city earns no
+                        # money; let that city bid higher and use local MI.
+                        high, high_routes, _, _ = premium_seed or ranked[0]
+                        by_city = {str(markets[i]["city"]): (i, cap, cost)
+                                   for i, cap, _, cost, *_ in bid_cities}
+                        price_options = [
+                            (city, units, units * max(0., low_routes[city]["price"] - by_city[city][2]))
+                            for city, units in low["low_pool_capacity"].items() if units > 0
+                        ]
+                        for cheap in _super_low_pool_subsets(price_options, available):
+                            premium = sorted(set(by_city) - cheap, key=lambda city: (
+                                -high["forecast_city_sold"].get(city, 0.) * high_routes[city]["price"],
+                                -float(markets[by_city[city][0]]["population"])
+                                * float(markets[by_city[city][0]]["penetration"]), city,
+                            ))
+                            if not premium:
+                                continue
+                            for targeted_mi in (False, True) if use_mi else (False,):
+                                ma, qi = (0., 0.) if targeted_mi else (float(high["ma"]), float(high["qi"]))
+                                routes = {city: dict(route) for city, route in high_routes.items()}
+                                for city in cheap:
+                                    routes[city].update(price=low_routes[city]["price"], marketing=0.)
+                                for city in premium:
+                                    i, cap, cost = by_city[city]
+                                    route = routes[city]
+                                    route["price"] = round(min(cap, max(
+                                        price_min, cost * 1.03, route["price"],
+                                        previous_prices[i] + 80 + (company_id * 137 + i * 41) % 133,
+                                    )), 2)
+                                    if targeted_mi:
+                                        route["marketing"] = 0.
+                                        if city in premium[:focus_count]:
+                                            *_, small, strong = _super_city_bid_options(
+                                                quote=route["price"], cap=cap, minimum=floors[i],
+                                                average=previous_prices[i], price_power=price_power,
+                                                allow_low=False, rivals=rival_metrics[i],
+                                                threshold=mi_thresholds[i], agents=route["agents"],
+                                                seed=company_id * 137 + i * 41 + official_round * 59,
+                                            )
+                                            allowance = cash_budget * .24 / min(focus_count, len(premium))
+                                            route["marketing"] = strong if strong <= allowance else min(small, allowance)
+                                marketing = {i: routes[city]["marketing"] for city, (i, _, _) in by_city.items()}
+                                ma_index_target, qi_index_target, marketing_targets = ma, qi, marketing
+                                budget_key = (ma, qi, tuple(sorted(marketing.items())))
+                                if budget_key not in full_group_budgets:
+                                    full_group_budgets[budget_key] = _max_budgeted_groups(
+                                        cash_budget, group["products"], formula_groups, budget_for,
+                                    )
+                                limit, max_budget = full_group_budgets[budget_key]
+                                prices = {city: route["price"] for city, route in routes.items()}
+                                covered = sum(low["low_pool_capacity"][city] for city in cheap)
+                                premium_sold = sum(high["forecast_city_sold"].get(city, 0.) for city in premium)
+                                sales_groups = max(0, math.ceil((covered + premium_sold - old_products) / group["products"]))
+                                for count in sorted({limit, min(limit, sales_groups)}):
+                                    key = ("split_price_pool", budget_key, count, tuple(prices.items()))
+                                    if count < 0 or (not count and not old_products) or key in refinement_keys:
+                                        continue
+                                    refinement_keys.add(key)
+                                    output = math.floor(count * group["products"])
+                                    refinements.append(({
+                                        **pure, "ma": ma, "qi": qi, "groups": count,
+                                        "marketing": marketing, "marketing_total": sum(marketing.values()),
+                                        "resolved_city_prices": prices, "split_price_pool": tuple(sorted(cheap)),
+                                        "budget_max_output": count == limit,
+                                    }, routes, old_products + output, max_budget if count == limit else budget_for(output)))
 
                     for candidate, cities, _, _ in seeds:
                         options = {}
@@ -4413,7 +4561,10 @@ def _submit_bots(
                                 refinement_keys.add(key)
                                 output = math.floor(count * group["products"])
                                 refinements.append(({
-                                    **candidate, "ma": ma, "qi": qi, "groups": count,
+                                    **{k: v for k, v in candidate.items() if k not in (
+                                        "low_pool_probe", "low_pool_capacity",
+                                    )},
+                                    "ma": ma, "qi": qi, "groups": count,
                                     "marketing": marketing, "marketing_total": sum(marketing.values()),
                                     "resolved_city_prices": prices, "budget_max_output": count == limit,
                                 }, revised, old_products + output, max_budget if count == limit else budget_for(output)))
@@ -4474,7 +4625,9 @@ def _submit_bots(
                     if sold <= 0 or available - sold < group["products"]:
                         continue
                     count = max(0, math.ceil((sold - old_products) / group["products"]))
-                    key = (count, candidate["ma"], candidate["qi"], candidate["price_ratio"])
+                    key = (count, candidate["ma"], candidate["qi"], tuple(
+                        (city, route["price"], route["marketing"]) for city, route in own_cities.items()
+                    ))
                     if key in refinement_keys or count >= candidate["groups"]:
                         continue
                     refinement_keys.add(key)

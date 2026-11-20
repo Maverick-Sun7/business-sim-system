@@ -171,6 +171,43 @@ class SuperBotActualBudgetTest(unittest.TestCase):
         self.assertGreaterEqual(float(city["price"]) + .005, max(3500, direct_cost * 1.03))
         self.assertLess(float(city["price"]), 25000 * 0.75)
 
+    def test_super_bot_settles_pure_and_city_split_price_pool_probes(self):
+        self.conn.execute(
+            "INSERT INTO market_config SELECT '深圳',home_enabled,max_loan,min_loan,interest_rate,"
+            "worker_initial_salary,engineer_initial_salary,component_material,product_material,"
+            "component_storage,product_storage,population,penetration,initial_avg_price,max_price,"
+            "transport_cost,worker_training_cost,engineer_training_cost FROM market_config WHERE city='广州'"
+        )
+        self.conn.execute("UPDATE market_config SET initial_avg_price=20000")
+        company_id = self.conn.execute(
+            "INSERT INTO companies(code,name,password_hash,home_city,cash,is_bot,is_super_bot,"
+            "setup_submitted_at,created_at) VALUES('S','S','unused','广州',200000000,1,1,?,?)",
+            (self.db.now_iso(), self.db.now_iso()),
+        ).lastrowid
+        for city in ("广州", "深圳"):
+            self.conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,3)", (company_id, city))
+        select = self.bots._select_empirical_super_candidate
+        checked = []
+
+        def inspect(candidates, *args, **kwargs):
+            pure = [c for c in candidates if c.get("low_pool_probe")]
+            self.assertTrue(pure)
+            self.assertTrue(any(c["groups"] > 0 and c["predicted_sold"] > 0 for c in pure))
+            self.assertTrue(all(c["ma"] == c["qi"] == c["marketing_total"] == 0. for c in pure))
+            hybrids = [c for c in candidates if c.get("split_price_pool") and c["marketing_total"] > 0.]
+            self.assertTrue(hybrids)
+            for candidate in hybrids:
+                cheap, = candidate["split_price_pool"]
+                premium, = set(candidate["resolved_city_prices"]) - {cheap}
+                self.assertLess(candidate["resolved_city_prices"][cheap], 20000)
+                self.assertGreater(candidate["resolved_city_prices"][premium], 20000)
+            checked.append(True)
+            return select(candidates, *args, **kwargs)
+
+        with patch.object(self.bots, "_select_empirical_super_candidate", side_effect=inspect):
+            self.bots.submit_super_bot_decisions(self.conn, 5, defer_rebalance=True)
+        self.assertEqual(checked, [True])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -46,6 +46,24 @@ class BotCompetitionTest(unittest.TestCase):
         self.assertGreater(self.bots._super_index_overbid(1300, 2500, [2500], 1.6), 2500)
         self.assertGreater(self.bots._super_index_overbid(1300, 5000, [9000]), 8000)
 
+    def test_price_pool_bids_price_the_actual_city_competition(self):
+        bid = self.bots._super_low_pool_quote
+        params = dict(average=20_000., cap=25_000., minimum=3500., price_power=20, seed=17)
+        opponents = [{"price": 19_000.}, {"price": 23_000.}]
+        shallow = bid(**params, rivals=opponents, weight_share=.55)
+        deep = bid(**params, rivals=opponents, weight_share=1.45)
+        self.assertLess(deep, 19_000.)
+        self.assertGreater(shallow, 19_000.)
+        self.assertLess(shallow, 20_000.)
+        self.assertEqual(bid(**{**params, "minimum": 20_000.}, rivals=opponents, weight_share=1.), None)
+
+    def test_low_price_overflow_has_a_single_city_alternative(self):
+        markets = [("广州", 90_000, 250_000), ("深圳", 20_000, 85_000), ("杭州", 10_000, 50_000)]
+        select = self.bots._super_low_pool_subsets
+        self.assertEqual(select(markets, 70_000)[0], {"广州"})
+        self.assertIn({"广州", "深圳"}, select(markets, 100_000))
+        self.assertNotIn({"广州", "深圳", "杭州"}, select(markets, 180_000))
+
     def test_small_price_step_changes_investment_cpi_as_well_as_price_cpi(self):
         def cpi(price):
             entries = [
