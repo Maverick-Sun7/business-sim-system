@@ -28,7 +28,7 @@ from .engine import (
 )
 
 
-BOT_API_VERSION = 43
+BOT_API_VERSION = 44
 _SUPER_BOT_SUBMISSION_LOCK = threading.Lock()
 _FORECAST_POOL_LOCK = threading.Lock()
 _FORECAST_POOL: ProcessPoolExecutor | None = None
@@ -1020,6 +1020,8 @@ def _forecast_submitted_market(
     conn: sqlite3.Connection,
     round_no: int,
     markets: list[dict[str, Any]],
+    *,
+    include_inputs: bool = False,
 ) -> dict[str, Any]:
     """Forecast the complete submitted field with the settlement algorithm.
 
@@ -1030,7 +1032,6 @@ def _forecast_submitted_market(
     """
     official_round = 1 if round_no < 0 else round_no
     growth = float(get_setting(conn, "market_growth", 1.10))
-    total_rounds = max(1, int(get_setting(conn, "total_rounds", 5)))
     ma_threshold = float(get_setting(conn, "cpi_ma_large_threshold", 1300))
     price_power = max(1, int(get_setting(conn, "cpi_price_power", 8)))
     players: dict[int, dict[str, Any]] = {}
@@ -1039,7 +1040,7 @@ def _forecast_submitted_market(
         conn,
         "SELECT c.id,c.product_inventory,d.worker_delta,d.engineer_delta,d.management_investment,"
         "d.production_volume,d.quality_investment FROM companies c JOIN decisions d "
-        "ON d.company_id=c.id WHERE d.round_no=? AND d.submitted_at IS NOT NULL",
+        "ON d.company_id=c.id WHERE d.round_no=? AND d.submitted_at IS NOT NULL ORDER BY c.id",
         (round_no,),
     ):
         company_id = int(row["id"])
@@ -1055,7 +1056,7 @@ def _forecast_submitted_market(
         return {"companies": {}, "player_average_prices": {}, "price_power": price_power}
 
     resolved_markets: list[dict[str, Any]] = []
-    for market in markets:
+    for market in sorted(markets, key=lambda m: str(m["city"])):
         city = str(market["city"])
         previous = one(
             conn,
@@ -1094,12 +1095,17 @@ def _forecast_submitted_market(
                     "marketing": float(route["marketing_investment"]),
                     "price": float(route["price"]),
                 }
-    return forecast_market_sales(
+    forecast_args = dict(
         players=list(players.values()),
         markets=resolved_markets,
         ma_large_threshold=ma_threshold,
         price_power=price_power,
     )
+    forecast = forecast_market_sales(**forecast_args)
+    if include_inputs:
+        forecast["inputs"] = forecast_args
+        forecast["operations"] = operating_states
+    return forecast
 
 
 def _forecast_submitted_cpi_capacity(
@@ -1494,6 +1500,12 @@ def _rebalance_super_bot_production(
                 use_complete_field=True,
             )
 
+    if round_no > 0:
+        # Compete for confirmed sales before shrinking stock or tapering MI.
+        # Otherwise a rival with a profitable price reply can lose the very
+        # inventory it needs to take secondary sales away from the leader.
+        preserve_ids.update(_recheck_uncontested_low_prices(conn, round_no, markets, preserve_ids))
+
     if (
         not all_super_field
         and not (all_bot_field and contest_round)
@@ -1565,7 +1577,13 @@ def _rebalance_super_bot_production(
         ):
             company_id = int(row["id"])
             if company_id in preserve_ids:
-                continue
+                # Keep the chosen prices and MI, even for an attacking bot.
+                # In the final round, however, an obsolete sell-out forecast
+                # must not freeze production when most of it will sit unsold.
+                available = float(field_forecast["companies"].get(company_id, {}).get("available", 0.))
+                if (row["is_disruptor_bot"] or official_round < total_rounds or available <= 0
+                        or capacities.get(company_id, 0.) >= available * .92):
+                    continue
             home = market_by_city.get(str(row["home_city"]), markets[0])
             old_products = max(0, int(row["product_inventory"] or 0))
             old_components = max(0, int(row["component_inventory"] or 0))
@@ -1755,6 +1773,334 @@ def _save_checked_bot_draft(conn: sqlite3.Connection, trial: sqlite3.Connection,
                          [tuple(values) for values in rows])
 
 
+def _settle_bot_trial_results(conn: sqlite3.Connection, round_no: int, *, city_changes=(), production=None):
+    from .engine import settle_round
+
+    with _bot_trial_database(conn) as settled:
+        # Remote-worker snapshots can omit these tables. Bonus is already in opening cash.
+        settled.execute("CREATE TABLE IF NOT EXISTS round_snapshots("
+                        "round_no INTEGER PRIMARY KEY,snapshot_json TEXT,created_at TEXT)")
+        settled.execute("CREATE TABLE IF NOT EXISTS round_bonuses("
+                        "round_no INTEGER,company_id INTEGER,amount REAL)")
+        if production is not None:
+            settled.execute(_UPDATE_BOT_PRODUCTION_OFFER, production)
+        if city_changes:
+            settled.executemany(_UPDATE_BOT_CITY_BID, city_changes)
+        settled.execute("UPDATE decisions SET is_draft=0 WHERE round_no=?", (round_no,))
+        settle_round(settled, round_no)
+        return all_rows(settled, "SELECT company_id,net_assets,net_profit,sales_revenue,sold,inventory "
+                        "FROM results WHERE round_no=? ORDER BY net_assets DESC,company_id", (round_no,))
+
+
+def _price_pool_units(result: dict[str, Any], city: str) -> float:
+    """Price-attributed units actually sold, not the unused headline CPI."""
+    visible = float(result["visible"].get(city, 0))
+    primary = (float(result["primary"].get(city, 0)) * float(result["price"].get(city, 0))
+               / visible) if visible > 0 else 0.0
+    secondary = float(result["secondary_by_category"].get(city, {}).get("price", 0))
+    return min(float(result["sold_units"].get(city, 0)), primary + secondary)
+
+
+def _uncontested_price_markets(companies, markets):
+    events = []
+    for market in markets:
+        city, size = market["city"], market["market_size"]
+        units = sorted(((_price_pool_units(result, city), company_id)
+                        for company_id, result in companies.items()), reverse=True)
+        if not units:
+            continue
+        captured, owner = units[0]
+        share = captured / max(1., sum(n for n, _ in units))
+        runner_up = units[1][0] if len(units) > 1 else 0.
+        # A team can run away by beating every rival in several cities, even
+        # if the rest of the field combined still gets most of each pool.
+        dominant = share >= .60 or (share >= .30 and captured >= 1.5 * runner_up)
+        # Catch a near-monopoly before it sells through the whole price pool,
+        # but only if it has already converted a meaningful amount into sales.
+        capacity = float(companies[owner]["price"].get(city, 0.))
+        almost_solo = share >= .90 and capacity >= size * PRICE_CPI_TOTAL / 100 * .90
+        min_capture = size * (.04 if almost_solo else .08)
+        if dominant and captured >= max(1., min_capture):
+            events.append((city, owner, captured, share))
+    return sorted(events, key=lambda event: (-event[2], event[0]))
+
+
+def _super_counter_routes(routes, rival_routes, targets, market_by_city, *, floor, cap,
+                          price_power, cash, seed):
+    """A small, deterministic set of city-level bids, not a uniform price cut."""
+    seen = set()
+    for city, owner in targets.items():
+        market = market_by_city[city]
+        rival_route = rival_routes[owner][city]
+        average = float(market["base_average_price"])
+        gap = max(0., average - rival_route["price"])
+        for strength in (.95, 1.20, 1.75):
+            changed = {city: dict(route) for city, route in routes.items()}
+            # With high KDS powers, ¥100 can be too much. Compare weight
+            # directly, including a narrow matching/overbid candidate.
+            quote = average - gap * strength ** (1. / price_power)
+            nudge = 1 + (seed % 7) / 10
+            price = min(cap, float(market["max_price"]), max(floor, quote - nudge))
+            changed[city]["price"] = round(price, 2)
+            key = tuple((city, route["price"], route["marketing"]) for city, route in changed.items())
+            if key not in seen:
+                seen.add(key)
+                yield changed
+
+        # Try a local MI push even when matching the price floor is pointless.
+        # Fund it from spare cash and/or a portion of the other cities' MI.
+        current_mi = routes[city]["marketing"]
+        effective = 1. + .1 * routes[city]["agents"]
+        rival_effective = rival_route["marketing"] * (1. + .1 * rival_route["agents"])
+        local_threshold = float(market["max_price"]) / 50 * market["market_size"] * .20 / (3 * effective)
+        desired = max(local_threshold * 1.15, rival_effective * 1.15 / effective) - current_mi
+        for discount in (False, True):
+            changed = {name: dict(route) for name, route in routes.items()}
+            donors = [(name, route["marketing"] * .30) for name, route in routes.items() if name != city]
+            extra = min(max(0., desired), cash + sum(amount for _, amount in donors))
+            if extra <= 1.:
+                continue
+            left = max(0., extra - cash)
+            for name, amount in donors:
+                transfer = min(left, amount)
+                changed[name]["marketing"] -= transfer
+                left -= transfer
+            changed[city]["marketing"] += extra
+            if discount:
+                changed[city]["price"] = min(routes[city]["price"], float(rival_route["price"]))
+            yield changed
+
+    if len(targets) > 1:
+        # Also compare competing cheaply in two cities while leaving every
+        # other route on its original price/MI plan.
+        changed = {city: dict(route) for city, route in routes.items()}
+        for city, owner in targets.items():
+            changed[city]["price"] = min(routes[city]["price"], float(rival_routes[owner][city]["price"]))
+        yield changed
+
+
+_UPDATE_BOT_CITY_BID = ("UPDATE city_decisions SET price=?,marketing_investment=? "
+                        "WHERE company_id=? AND round_no=? AND city=?")
+_UPDATE_BOT_PRODUCTION_OFFER = (
+    "UPDATE decisions SET production_volume=?,worker_delta=?,engineer_delta=?,"
+    "management_investment=?,quality_investment=? WHERE company_id=? AND round_no=?"
+)
+
+
+def _counter_production_offer(conn, round_no, cid, operating, wanted):
+    """One affordable group-based expansion to test, using post-payroll cash."""
+    if wanted <= 0 or operating["cash_pre_sales"] <= 0:
+        return None
+    row = one(conn,
+        "SELECT d.*,c.patents,c.product_inventory,m.component_material,m.product_material,"
+        "m.component_storage,m.product_storage "
+        "FROM decisions d JOIN companies c ON c.id=d.company_id "
+        "JOIN market_config m ON m.city=c.home_city WHERE d.company_id=? AND d.round_no=?",
+        (cid, round_no))
+    if row is None:
+        return None
+    group = _balanced_production_group(
+        get_setting(conn, "component_workers", 3.), get_setting(conn, "component_hours", 7.),
+        get_setting(conn, "product_engineers", 4.), get_setting(conn, "product_hours", 14.),
+        get_setting(conn, "components_per_product", 7.),
+    )
+    output = group["products"]
+    factor = float(get_setting(conn, "patent_factor", .70)) ** int(row["patents"])
+    ma, qi = operating["ma_index"], operating["qi_index"]
+    per_group = (
+        group["workers"] * (row["worker_salary"] * 3 + get_setting(conn, "worker_training_cost", 0.) + ma)
+        + group["engineers"] * (row["engineer_salary"] * 3 + get_setting(conn, "engineer_training_cost", 0.) + ma)
+        + group["components"] * (row["component_material"] * factor + row["component_storage"])
+        + output * (row["product_material"] * factor + row["product_storage"] + qi)
+    )
+    batches = min(math.ceil(wanted / output), int(operating["cash_pre_sales"] * .80 // max(1., per_group)))
+    if batches <= 0:
+        return None
+    planned_groups = int(math.ceil(operating["produced"] / output) + batches)
+    workers = _staff_delta(conn, cid, "worker", round_no, planned_groups * group["workers"])
+    engineers = _staff_delta(conn, cid, "engineer", round_no, planned_groups * group["engineers"])
+    # Expanding must not force a layoff or weaken the indexes of the bid.
+    workers = max(int(row["worker_delta"]), workers)
+    engineers = max(int(row["engineer_delta"]), engineers)
+    headcount = employee_count(conn, cid, "worker") + workers + employee_count(conn, cid, "engineer") + engineers
+    qty = int(math.floor(planned_groups * output))
+    return qty, workers, engineers, ma * max(0, headcount), qi * (row["product_inventory"] * 1.2 + qty), cid, round_no
+
+
+def _counter_final_stock_safe(before, after, peer_ids):
+    # There's no next round to sell stock left behind. Do not approve a
+    # counterbid that creates a new stock pile or worsens an existing one.
+    for cid in peer_ids:
+        original, proposed = before[cid], after[cid]
+        old_stock, new_stock = float(original["inventory"]), float(proposed["inventory"])
+        offered = float(proposed["sold"]) + new_stock
+        if new_stock > max(old_stock, .08 * offered) + 1e-6:
+            return False
+    return True
+
+
+def _recheck_uncontested_low_prices(conn, round_no, markets, preserve_ids):
+    """Give up to two competitors a bounded reply to the complete field."""
+    if one(conn, "SELECT 1 FROM results WHERE round_no=?", (round_no,)) or one(
+        conn, "SELECT 1 FROM companies c WHERE NOT EXISTS (SELECT 1 FROM decisions d "
+        "WHERE d.company_id=c.id AND d.round_no=? AND d.submitted_at IS NOT NULL)", (round_no,),
+    ):
+        return set()
+    eligible = {int(row["company_id"]) for row in all_rows(conn,
+        "SELECT d.company_id FROM decisions d JOIN companies c ON c.id=d.company_id "
+        "WHERE d.round_no=? AND d.is_draft=1 AND c.is_bot=1 AND c.is_super_bot=1 "
+        "AND c.is_disruptor_bot=0", (round_no,)) if int(row["company_id"]) not in preserve_ids}
+    if not eligible:
+        return set()
+    floor = max(.01, float(get_setting(conn, "price_min", 3500.)))
+    cap = float(get_setting(conn, "price_max", 25000.))
+    final_round = round_no >= int(get_setting(conn, "total_rounds", 5))
+    peer_ids = {int(row["id"]) for row in all_rows(conn,
+        "SELECT id FROM companies WHERE is_bot=1 AND is_super_bot=1 AND is_disruptor_bot=0")} if final_round else set()
+    # The joint pass edits the authoritative draft before we get here. SQLite
+    # serialization of a deserialized worker database needs those edits saved.
+    conn.commit()
+    checked, accepted = set(), set()
+    for _ in range(min(4, len(eligible))):
+        if len(accepted) >= 2:
+            break
+        if not eligible - checked:
+            break
+        field = _forecast_submitted_market(conn, round_no, markets, include_inputs=True)
+        args = field.get("inputs")
+        if not args:
+            break
+        companies = field["companies"]
+        # Both human and bot submissions can corner the price pool. Only the
+        # responding strategic bot drafts selected above can be changed.
+        events = _uncontested_price_markets(companies, args["markets"])
+        if not events:
+            break
+        market_by_city = {market["city"]: market for market in args["markets"]}
+        players = {player["company_id"]: player for player in args["players"]}
+        routes = {cid: player["cities"] for cid, player in players.items()}
+        jobs = []
+        for company_id in sorted(eligible - checked):
+            company = companies.get(company_id, {})
+            available = company.get("available", 0.)
+            spare = available - company.get("sold_total", 0.)
+            can_fund_stock = field["operations"][company_id]["cash_pre_sales"] > 0
+            reachable = []
+            for city, owner, captured, share in events:
+                if (owner == company_id or city not in routes.get(company_id, {})
+                        or (available <= 0 and not can_fund_stock)):
+                    continue
+                own_units = _price_pool_units(companies[company_id], city)
+                if own_units < captured * .8:
+                    reachable.append((city, owner, captured, share))
+            focus = reachable[:2]
+            if focus:
+                # Start with teams that can add sales rather than simply move
+                # stock from a more profitable city. Sell-outs remain eligible
+                # to shift part of their volume if the exact trial makes sense.
+                upside = sum(min(available, captured, spare + company["sold_units"][city] + available * .15)
+                             * routes[owner][city]["price"] for city, owner, captured, _ in focus)
+                jobs.append((upside, -company_id, focus))
+        if not jobs:
+            break
+        _, neg_id, focus = max(jobs)
+        company_id = -neg_id
+        checked.add(company_id)
+        current = routes[company_id]
+        operation = field["operations"][company_id]
+        cash = max(0., float(operation["cash_pre_sales"]))
+        targets = {city: owner for city, owner, _, _ in focus}
+
+        def bid_options(options_args, options_routes, budget, production=None):
+            ours = options_routes[company_id]
+            offers = _super_counter_routes(
+                ours, options_routes, targets, market_by_city, floor=floor, cap=cap,
+                price_power=options_args["price_power"], cash=budget, seed=company_id + round_no,
+            )
+            for offer in offers:
+                if offer != ours:
+                    payload = dict(options_args, players=[
+                        {**p, "cities": offer} if p["company_id"] == company_id else p
+                        for p in options_args["players"]
+                    ])
+                    yield offer, production, cash - budget, payload
+
+        proposed = list(bid_options(args, routes, cash))
+        own = companies[company_id]
+        spare = own["available"] - own["sold_total"]
+        # Sell-outs with budget can widen the contest instead of shifting
+        # existing stock out of their best cities. Try one production offer.
+        if spare <= own["available"] * .05:
+            wanted = sum(captured for _, _, captured, _ in focus) * .60
+            expansion = _counter_production_offer(conn, round_no, company_id, operation, wanted)
+            if expansion is not None:
+                with _bot_trial_database(conn) as trial:
+                    trial.execute(_UPDATE_BOT_PRODUCTION_OFFER, expansion)
+                    trial.commit()
+                    expanded = _forecast_submitted_market(trial, round_no, markets, include_inputs=True)
+                expanded_operation = expanded["operations"][company_id]
+                if expanded_operation["available"] > operation["available"] and all(
+                    expanded_operation["city_decisions"][city]["agents_after"] == route["agents"]
+                    and expanded_operation["city_decisions"][city]["marketing_investment"] + .01 >= route["marketing"]
+                    for city, route in current.items()
+                ):
+                    expanded_args = expanded["inputs"]
+                    expanded_routes = {p["company_id"]: p["cities"] for p in expanded_args["players"]}
+                    proposed.extend(bid_options(expanded_args, expanded_routes,
+                        max(0., expanded_operation["cash_pre_sales"]), expansion))
+
+        forecasts = _forecast_candidates([payload for _, _, _, payload in proposed])
+        promising = []
+        for (option, production, extra_cost, _), forecast in zip(proposed, forecasts):
+            after = forecast["companies"]
+            improvement = 0.
+            for city, owner, captured, before_share in focus:
+                units = [_price_pool_units(row, city) for row in after.values()]
+                share = max(units) / max(1., sum(units))
+                target_loss = captured - _price_pool_units(after[owner], city)
+                own_gain = after[company_id]["sold_units"][city] - companies[company_id]["sold_units"][city]
+                if (own_gain > 0 and share <= before_share - .02
+                        and target_loss >= max(1., captured * .05)):
+                    improvement += target_loss * routes[owner][city]["price"]
+            if improvement > 0:
+                own = after[company_id]["sold_units"]
+                revenue = sum(own[city] * route["price"] - route["marketing"] for city, route in option.items())
+                promising.append((revenue - extra_cost + .15 * improvement, improvement, option, production))
+        if not promising:
+            continue
+        baseline = {row["company_id"]: row for row in _settle_bot_trial_results(conn, round_no)}
+        original = baseline[company_id]["net_profit"]
+        # Never turn a profitable team into a subsidized loss-maker just to
+        # intercept a rival. Distressed teams must strictly improve.
+        min_profit = original * .95 if original > 0 else original + .01
+        best_score, best_offer = 0., None
+        for _, improvement, option, production in sorted(promising, key=lambda row: row[0], reverse=True)[:3]:
+            changes = [(route["price"], route["marketing"], company_id, round_no, city)
+                       for city, route in option.items() if route != current[city]]
+            if not changes:
+                continue
+            after = {row["company_id"]: row for row in _settle_bot_trial_results(
+                conn, round_no, city_changes=changes, production=production,
+            )}
+            if final_round and not _counter_final_stock_safe(baseline, after, peer_ids):
+                continue
+            profit = after[company_id]["net_profit"]
+            target_ids = {owner for _, owner, _, _ in focus}
+            actual_damage = sum(max(0., baseline[owner]["net_profit"] - after[owner]["net_profit"])
+                                for owner in target_ids)
+            score = profit - original + .25 * min(actual_damage, improvement)
+            if profit >= min_profit and actual_damage > 0 and score > best_score:
+                best_score, best_offer = score, (changes, production)
+        if best_offer:
+            changes, production = best_offer
+            if production is not None:
+                conn.execute(_UPDATE_BOT_PRODUCTION_OFFER, production)
+            conn.executemany(_UPDATE_BOT_CITY_BID, changes)
+            conn.commit()
+            accepted.add(company_id)
+    return accepted
+
+
 def _recheck_first_place_draft(conn: sqlite3.Connection, round_no: int) -> None:
     """Rerun just one contender against all saved drafts and check exact rank."""
     if one(conn, "SELECT 1 FROM results WHERE round_no=?", (round_no,)):
@@ -1764,21 +2110,6 @@ def _recheck_first_place_draft(conn: sqlite3.Connection, round_no: int) -> None:
         "WHERE c.is_bot=1 AND c.is_super_bot=1 AND c.is_disruptor_bot=0 AND d.is_draft=1", (round_no,))}
     if not contenders:
         return
-    from .engine import settle_round
-
-    def exact_results(database):
-        with _bot_trial_database(database) as settled:
-            # Worker snapshots deliberately omit rollback snapshots and bonus
-            # records; opening cash already includes the credited bonus.
-            settled.execute("CREATE TABLE IF NOT EXISTS round_snapshots("
-                            "round_no INTEGER PRIMARY KEY,snapshot_json TEXT,created_at TEXT)")
-            settled.execute("CREATE TABLE IF NOT EXISTS round_bonuses("
-                            "round_no INTEGER,company_id INTEGER,amount REAL)")
-            settled.execute("UPDATE decisions SET is_draft=0 WHERE round_no=?", (round_no,))
-            settle_round(settled, round_no)
-            return all_rows(settled, "SELECT company_id,net_assets,net_profit,sales_revenue,sold,inventory FROM results WHERE round_no=? "
-                            "ORDER BY net_assets DESC,company_id", (round_no,))
-
     def score(rows, company_id):
         own = next(row for row in rows if row["company_id"] == company_id)
         gap = float(own["net_assets"]) - max(float(row["net_assets"]) for row in rows
@@ -1789,7 +2120,7 @@ def _recheck_first_place_draft(conn: sqlite3.Connection, round_no: int) -> None:
     if one(conn, "SELECT 1 FROM companies c WHERE NOT EXISTS (SELECT 1 FROM decisions d "
                  "WHERE d.company_id=c.id AND d.round_no=? AND d.submitted_at IS NOT NULL)", (round_no,)):
         return
-    baseline = exact_results(conn)
+    baseline = _settle_bot_trial_results(conn, round_no)
     if len(baseline) < 2:
         return
     leader_id = int(baseline[0]["company_id"])
@@ -1817,7 +2148,7 @@ def _recheck_first_place_draft(conn: sqlite3.Connection, round_no: int) -> None:
     }
 
     def score_trial(database):
-        rows = exact_results(database)
+        rows = _settle_bot_trial_results(database, round_no)
         gap, risk = score(rows, company_id)
         if not human_present:
             # Let the leader pull away. Check that the teams behind it

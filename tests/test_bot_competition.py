@@ -24,6 +24,122 @@ class BotCompetitionTest(unittest.TestCase):
 
         self.bots = bots
 
+    def test_price_monopoly_detection_counts_secondary_sales_not_unused_cpi(self):
+        markets = [{"city": "A", "market_size": 1000}]
+
+        def sold(visible, price, primary, secondary, actual):
+            return {"visible": {"A": visible}, "price": {"A": price}, "primary": {"A": primary},
+                    "secondary_by_category": {"A": {"price": secondary}}, "sold_units": {"A": actual}}
+
+        self.assertEqual(self.bots._uncontested_price_markets(
+            {1: sold(550, 400, 20, 0, 20), 2: sold(190, 0, 190, 0, 190)}, markets), [])
+        self.assertEqual(self.bots._uncontested_price_markets(
+            {1: sold(400, 400, 50, 0, 50), 2: sold(190, 0, 190, 0, 190)}, markets),
+            [("A", 1, 50., 1.)])
+        self.assertEqual(self.bots._uncontested_price_markets(
+            {1: sold(100, 80, 100, 170, 270), 2: sold(150, 100, 90, 0, 90)}, markets),
+            [("A", 1, 250., 250. / 310.)])
+        self.assertEqual(self.bots._uncontested_price_markets(
+            {1: sold(100, 80, 100, 110, 210), **{
+                i: sold(150, 100, 150, 0, 150) for i in (2, 3, 4)
+            }}, markets), [("A", 1, 190., 190. / 490.)])
+
+    def test_a_sold_out_super_bot_can_counter_one_city_without_changing_the_other(self):
+        self._check_city_counter(challenger_cash=0)
+
+    def test_one_super_bot_can_counter_a_human_without_rewriting_their_bid(self):
+        self._check_city_counter(challenger_cash=0, human_leader=True)
+
+    def test_a_super_bot_does_not_chase_a_human_at_a_heavy_profit_cost(self):
+        self._check_city_counter(challenger_cash=0, human_leader=True, other_price=9500., counter=False)
+
+    def test_a_sold_out_super_bot_can_expand_in_groups_to_contest_a_city(self):
+        self._check_city_counter(challenger_cash=20_000_000)
+
+    def test_a_super_bot_with_cash_can_restart_production_to_contest_a_city(self):
+        self._check_city_counter(challenger_cash=20_000_000, challenger_stock=0)
+
+    def test_terminal_counterbid_cannot_strand_a_super_bot_peers_stock(self):
+        before = {1: {"sold": 1000, "inventory": 0}, 2: {"sold": 900, "inventory": 100}}
+        safe = self.bots._counter_final_stock_safe
+        self.assertTrue(safe(before, {**before, 1: {"sold": 930, "inventory": 70}}, {1, 2}))
+        self.assertFalse(safe(before, {**before, 1: {"sold": 910, "inventory": 90}}, {1, 2}))
+        self.assertFalse(safe(before, {**before, 2: {"sold": 895, "inventory": 105}}, {1, 2}))
+
+    def _check_city_counter(self, challenger_cash, challenger_stock=300, *,
+                            human_leader=False, other_price=5000., counter=True):
+        from sim import db
+
+        path = Path(os.environ["SIM_DB_PATH"])
+        with patch.object(db, "DB_PATH", path):
+            db.init_db()
+            with db.connect() as conn:
+                conn.execute("DELETE FROM companies")
+                conn.execute("DELETE FROM market_config WHERE city NOT IN ('广州','深圳')")
+                conn.execute("UPDATE market_config SET population=1000,penetration=1,initial_avg_price=10000,"
+                             "worker_initial_salary=1000,engineer_initial_salary=1000,"
+                             "component_material=10,product_material=10,component_storage=1,product_storage=1")
+                conn.execute("INSERT OR IGNORE INTO rounds(round_no,status) VALUES(1,'open')")
+                created = []
+                for code, qty, quotes in (("Leader", 1200, (7000, None)),
+                                          ("Challenger", challenger_stock, (11000, other_price))):
+                    is_bot = int(not (code == "Leader" and human_leader))
+                    cid = conn.execute(
+                        "INSERT INTO companies(code,name,password_hash,home_city,cash,product_inventory,"
+                        "setup_submitted_at,created_at,is_bot,is_super_bot) VALUES(?,?,?,'广州',?,?,?,?,?,?)",
+                        (code, code, "unused", challenger_cash if code == "Challenger" else 0,
+                         qty, db.now_iso(), db.now_iso(), is_bot, is_bot),
+                    ).lastrowid
+                    created.append(cid)
+                    conn.execute("INSERT INTO decisions(company_id,round_no,worker_salary,engineer_salary,"
+                                 "submitted_at,is_draft) VALUES(?,1,1000,1000,?,?)",
+                                 (cid, db.now_iso(), int(code == "Challenger")))
+                    for city, quote in zip(("广州", "深圳"), quotes):
+                        if quote is None:
+                            continue
+                        conn.execute("INSERT INTO agents(company_id,city,count) VALUES(?,?,1)", (cid, city))
+                        conn.execute("INSERT INTO city_decisions(company_id,round_no,city,price) VALUES(?,1,?,?)",
+                                     (cid, city, quote))
+                conn.commit()
+                leader, challenger = created
+                markets = [dict(m) for m in conn.execute("SELECT * FROM market_config ORDER BY city")]
+                before = self.bots._forecast_submitted_market(conn, 1, markets)["companies"]
+                self.assertEqual(before[challenger]["sold_total"], challenger_stock)
+                old_profits = {r["company_id"]: r["net_profit"] for r in self.bots._settle_bot_trial_results(conn, 1)}
+                baseline_decisions = conn.execute("SELECT * FROM decisions ORDER BY company_id").fetchall()
+                baseline_city_decisions = conn.execute("SELECT * FROM city_decisions ORDER BY company_id,city").fetchall()
+
+                # A second city can stay on its existing bid while the first
+                # is matched. Final/manual decisions are not rewritten.
+                replies = self.bots._recheck_uncontested_low_prices(conn, 1, markets, set())
+                self.assertEqual(replies, {challenger} if counter else set())
+                city_decisions = conn.execute("SELECT * FROM city_decisions ORDER BY company_id,city").fetchall()
+                self.assertEqual([row for row in city_decisions if row["company_id"] == leader],
+                                 [row for row in baseline_city_decisions if row["company_id"] == leader])
+                if not counter:
+                    self.assertEqual(city_decisions, baseline_city_decisions)
+                    self.assertEqual(conn.execute("SELECT * FROM decisions ORDER BY company_id").fetchall(),
+                                     baseline_decisions)
+                    return
+                after = self.bots._forecast_submitted_market(conn, 1, markets, include_inputs=True)
+                self.assertLess(self.bots._price_pool_units(after["companies"][leader], "广州"), 300)
+                self.assertGreater(after["companies"][challenger]["sold_units"]["广州"], 0)
+                quotes = {(r["company_id"], r["city"]): r["price"] for r in conn.execute("SELECT * FROM city_decisions")}
+                self.assertEqual(quotes[leader, "广州"], 7000.)
+                self.assertEqual(quotes[challenger, "深圳"], other_price)
+                decisions = conn.execute("SELECT * FROM decisions ORDER BY company_id").fetchall()
+                self.assertEqual(decisions[0], baseline_decisions[0])
+                if challenger_cash:
+                    self.assertGreater(decisions[1]["production_volume"], 0)
+                    self.assertEqual(decisions[1]["production_volume"] % 72, 0)
+                    self.assertGreater(after["companies"][challenger]["sold_total"], challenger_stock)
+                else:
+                    self.assertEqual(decisions, baseline_decisions)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM results").fetchone()[0], 0)
+                new_profits = {r["company_id"]: r["net_profit"] for r in self.bots._settle_bot_trial_results(conn, 1)}
+                self.assertGreater(new_profits[challenger], old_profits[challenger])
+                self.assertLess(new_profits[leader], old_profits[leader])
+
     def test_city_bid_options_probe_small_discounts_and_different_team_quotes(self):
         def options(seed, rival_price=19_000, rival_mi=600_000, agents=2, allow_low=True):
             return self.bots._super_city_bid_options(
