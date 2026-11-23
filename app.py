@@ -40,7 +40,7 @@ from sim import genius as _genius_module
 # import one consistent version of the application.
 if (
     not hasattr(_db_module, "delete_city")
-    or getattr(_db_module, "DB_API_VERSION", 0) < 12
+    or getattr(_db_module, "DB_API_VERSION", 0) < 13
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
@@ -794,7 +794,7 @@ def player_visible_round(conn: sqlite3.Connection) -> int:
     ):
         return round_no
     pending_round = st.session_state.get("player_round_countdown_pending_round")
-    if str(round_row["status"]) == "open" and pending_round is not None and int(pending_round) == round_no:
+    if str(round_row["status"]) in ("open", "paused") and pending_round is not None and int(pending_round) == round_no:
         return max(0, round_no - 2)
     return max(0, round_no - 1)
 
@@ -849,19 +849,56 @@ def hero(title: str, subtitle: str) -> None:
     )
 
 
-def rank_rows(conn: sqlite3.Connection, round_no: int | None = None) -> list[dict[str, Any]]:
+# Show the opening credit on the preceding round's point: it was earned at
+# that transition, and the next settlement already includes it in its cash.
+# Keep the original result and report ledger intact.
+_OPENING_BONUS_JOIN = (
+    " LEFT JOIN rounds following ON following.round_no=r.round_no+1 AND following.status IN ('open','paused','settled')"
+    " LEFT JOIN round_bonuses b ON b.round_no=following.round_no AND b.company_id=r.company_id "
+)
+_ADJUSTED_NET_ASSETS = "(r.net_assets+COALESCE(b.amount,0))"
+
+
+def rank_rows(conn: sqlite3.Connection, round_no: int | None = None, *, settled_only: bool = False) -> list[dict[str, Any]]:
     if round_no is None:
         latest = one(conn, "SELECT MAX(round_no) AS n FROM results WHERE round_no>=1")
         round_no = int(latest["n"] or 0) if latest else 0
     if round_no == 0:
         return []
-    rows = all_rows(
-        conn,
-        "SELECT c.id,c.code,c.name,c.home_city,r.* FROM results r JOIN companies c ON c.id=r.company_id "
-        "WHERE r.round_no=? ORDER BY r.net_assets DESC,c.id",
-        (round_no,),
+    fields = "c.id,c.code,c.name,c.home_city,r.*"
+    source = " FROM results r JOIN companies c ON c.id=r.company_id "
+    if not settled_only:
+        fields += (f",{_ADJUSTED_NET_ASSETS} AS standing_net_assets,"
+                   "r.cash+COALESCE(b.amount,0) AS standing_cash,"
+                   "r.total_assets+COALESCE(b.amount,0) AS standing_total_assets")
+        source += _OPENING_BONUS_JOIN
+    score = "r.net_assets" if settled_only else _ADJUSTED_NET_ASSETS
+    rows = all_rows(conn, f"SELECT {fields}{source}WHERE r.round_no=? ORDER BY {score} DESC,c.id", (round_no,))
+    ranked = []
+    for index, row in enumerate(rows, 1):
+        entry = dict(row) | {"rank": index}
+        if not settled_only:
+            for field in ("net_assets", "cash", "total_assets"):
+                entry[field] = entry.pop(f"standing_{field}")
+        ranked.append(entry)
+    return ranked
+
+
+def wealth_result_rows(conn: sqlite3.Connection, *, through_round: int | None = None,
+                       company_id: int | None = None) -> list[sqlite3.Row]:
+    where = ["r.round_no>=1"]
+    params = []
+    if through_round is not None:
+        where.append("r.round_no<=?")
+        params.append(through_round)
+    if company_id is not None:
+        where.append("r.company_id=?")
+        params.append(company_id)
+    return all_rows(
+        conn, f"SELECT c.id,c.code,c.name,r.round_no,{_ADJUSTED_NET_ASSETS} AS net_assets "
+        "FROM results r JOIN companies c ON c.id=r.company_id " + _OPENING_BONUS_JOIN
+        + f"WHERE {' AND '.join(where)} ORDER BY r.round_no,c.id", tuple(params),
     )
-    return [dict(row) | {"rank": index + 1} for index, row in enumerate(rows)]
 
 
 def render_login() -> None:
@@ -1104,13 +1141,10 @@ def render_player_overview(company: sqlite3.Row, animate_reveal: bool = False) -
             (company["id"], visible_round),
         )
         ranking = rank_rows(conn, int(latest["round_no"]) if latest else 0)
-        my_rank = next((row["rank"] for row in ranking if row["id"] == company["id"]), None)
+        my_standing = next((row for row in ranking if row["id"] == company["id"]), None)
+        my_rank = my_standing["rank"] if my_standing else None
         ready = setup_status(conn)
-        wealth_rows = all_rows(
-            conn,
-            "SELECT round_no,net_assets FROM results WHERE company_id=? AND round_no>=1 AND round_no<=? ORDER BY round_no",
-            (company["id"], visible_round),
-        )
+        wealth_rows = wealth_result_rows(conn, through_round=visible_round, company_id=int(company["id"]))
 
     podium_items = []
     for position in range(1, 4):
@@ -1124,9 +1158,9 @@ def render_player_overview(company: sqlite3.Row, animate_reveal: bool = False) -
         latest_report = json.loads(latest["report_json"])
         latest_hr = latest_report.get("human_resources", {})
         summary_title = f"Round {int(latest['round_no'])} Summary"
-        total_assets = float(latest["total_assets"])
+        total_assets = float((my_standing or latest)["total_assets"])
         debt = float(latest["debt"])
-        net_assets = float(latest["net_assets"])
+        net_assets = float((my_standing or latest)["net_assets"])
         workers = int(latest_hr.get("workers", 0))
         engineers = int(latest_hr.get("engineers", 0))
         inventory = int(latest["inventory"])
@@ -1705,7 +1739,7 @@ def ranking_table(rows: list[dict[str, Any]]) -> pd.DataFrame:
 
 def render_ranking(admin: bool = False) -> None:
     if admin:
-        hero("财富排行榜", "按当轮结束后的 Net Assets 排序；Net Assets = 总资产（含期末库存价值）− 负债，所有费用均已计入。")
+        hero("财富排行榜", "按 Net Assets 排序：净资产 = 现金 − 负债，不计库存。")
     with connect() as conn:
         visible_round = player_visible_round(conn) if not admin else None
         latest = one(
@@ -1726,7 +1760,7 @@ def render_ranking(admin: bool = False) -> None:
                 () if admin else (visible_round,),
             )
         ]
-        selected = st.selectbox("选择轮次", round_numbers, index=0)
+        selected = st.selectbox("选择轮次", round_numbers, index=0, key=f"ranking_round_{admin}_{latest_round}")
         rows = rank_rows(conn, selected)
     if not admin:
         current_company_id = int(st.session_state.get("auth", {}).get("company_id", 0))
@@ -1771,7 +1805,7 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
         st.error("未找到报表。")
         return
     report = json.loads(row["report_json"])
-    ranking = rank_rows(conn, round_no)
+    ranking = rank_rows(conn, round_no, settled_only=True)
     my_rank = next((item["rank"] for item in ranking if item["id"] == company_id), "—")
     metrics = report["key_metrics"]
     st.markdown(f"### {company['code']} · {company['name']}　｜　第 {round_no} 轮报表")
@@ -1780,7 +1814,7 @@ def render_report_detail(conn: sqlite3.Connection, company_id: int, round_no: in
     cols[0].metric("总资产", money(metrics["total_assets"]))
     cols[1].metric("负债", money(metrics["debt"]))
     cols[2].metric("净资产 / Net Assets", money(metrics["net_assets"]))
-    cols[3].metric("排名", f"#{my_rank}")
+    cols[3].metric("结算排名", f"#{my_rank}")
     cols = st.columns(3)
     cols[0].metric("销售收入", money(metrics["sales_revenue"]))
     cols[1].metric("总成本", money(metrics["cost"]))
@@ -1962,11 +1996,8 @@ def render_reports(company: sqlite3.Row | None, admin: bool = False) -> None:
 def render_wealth(company: sqlite3.Row | None, admin: bool = False) -> None:
     hero("财富曲线", "按照官方样式对比全部队伍每轮 Net Assets（总资产 − 负债）。")
     with connect() as conn:
-        rows = all_rows(
-            conn,
-            "SELECT c.id,c.code,c.name,r.round_no,r.net_assets FROM results r JOIN companies c ON c.id=r.company_id "
-            "WHERE r.round_no>=1 ORDER BY r.round_no,c.id",
-        )
+        rows = wealth_result_rows(conn, through_round=None if admin else player_visible_round(conn),
+                                  company_id=None if admin or company is None else int(company["id"]))
         companies = all_rows(conn, "SELECT id,code,name FROM companies ORDER BY id")
         initial_cash = float(get_setting(conn, "initial_cash", 6_500_000.0))
     if not rows:
@@ -3241,7 +3272,7 @@ def render_admin_rounds(ai_mode: bool = False) -> None:
         else:
             next_round = int(round_row["round_no"]) + 1
             st.markdown("#### 下一轮 Bonus")
-            st.caption("填写后点击开启下一轮，Bonus 会先加入对应队伍现金；留空或填 0 即不发放。")
+            st.caption("开启下一轮时，Bonus 加入现金和净资产；玩家会在倒计时后看到更新后的排名，不会看到其他队伍的发放明细。")
             with st.form(f"next_round_{next_round}"):
                 minutes = st.number_input("下一轮时长（分钟）", min_value=1, value=default_minutes, step=1)
                 bonus_values: dict[int, float] = {}
@@ -3254,22 +3285,15 @@ def render_admin_rounds(ai_mode: bool = False) -> None:
                         )
                 start_next = st.form_submit_button(f"发放 Bonus 并开启第 {next_round} 轮", type="primary", use_container_width=True)
             if start_next:
-                start = datetime.now(timezone.utc)
-                with connect() as conn:
-                    for company_id, amount in bonus_values.items():
-                        clean_amount = max(0.0, float(amount))
-                        if clean_amount <= 0:
-                            continue
-                        conn.execute("UPDATE companies SET cash=cash+? WHERE id=?", (clean_amount, company_id))
-                        conn.execute(
-                            "INSERT INTO round_bonuses(company_id,round_no,amount,created_at) VALUES(?,?,?,?) "
-                            "ON CONFLICT(company_id,round_no) DO UPDATE SET amount=excluded.amount,created_at=excluded.created_at",
-                            (company_id, next_round, clean_amount, now_iso()),
-                        )
-                    conn.execute("INSERT INTO rounds(round_no,status,starts_at,ends_at) VALUES(?,'open',?,?)", (next_round, start.isoformat(), (start + timedelta(minutes=int(minutes))).isoformat()))
-                    submit_bot_decisions(conn, next_round)
-                flash("success", f"第 {next_round} 轮已开始。")
-                st.rerun()
+                try:
+                    with connect() as conn:
+                        opened = open_next_round(conn, int(round_row["round_no"]), int(minutes), bonus_values)
+                        submit_bot_decisions(conn, opened)
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    flash("success", f"第 {opened} 轮已开始。")
+                    st.rerun()
 
     if decisions:
         st.subheader("队伍状态")

@@ -18,7 +18,7 @@ from .defaults import DEFAULT_MARKETS, DEFAULT_SETTINGS, GLOBAL_SETTING_LABELS
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.environ.get("SIM_DB_PATH", BASE_DIR / "data" / "sim.db"))
-DB_API_VERSION = 12
+DB_API_VERSION = 13
 OBOS_PRESET_NAME = "25人OBOS"
 SMALL_FIELD_PRESET_NAME = "3人2000场"
 KDS_SETTING_FIELDS = {key: label for key, label in GLOBAL_SETTING_LABELS.items()
@@ -616,6 +616,8 @@ def _reconstruct_pre_round_snapshot(conn: sqlite3.Connection, target_round: int)
         previous_report: dict[str, Any] = {}
         if previous_result is not None:
             previous_report = json.loads(previous_result["report_json"])
+        opening_bonus = one(conn, "SELECT amount FROM round_bonuses WHERE company_id=? AND round_no=?",
+                            (company_id, target_round))
         production = previous_report.get("production", {})
         research = previous_report.get("research", {})
         companies.append(
@@ -624,7 +626,8 @@ def _reconstruct_pre_round_snapshot(conn: sqlite3.Connection, target_round: int)
                 "code": company["code"],
                 "name": company["name"],
                 "home_city": company["home_city"],
-                "cash": float(previous_result["cash"]) if previous_result is not None else initial_cash,
+                "cash": (float(previous_result["cash"]) if previous_result is not None else initial_cash)
+                + (float(opening_bonus["amount"]) if opening_bonus is not None else 0.0),
                 "debt": float(previous_result["debt"]) if previous_result is not None else 0.0,
                 "patents": int(research.get("patents_after", 0)) if previous_result is not None else 0,
                 "research_balance": float(research.get("accumulated_after", 0)) if previous_result is not None else 0,
@@ -797,6 +800,8 @@ def open_next_round(
     current_no = int(current_round_no)
     if current_no < 1:
         raise ValueError("测试轮结束后请使用测试轮恢复流程开启第一轮。")
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     current = one(conn, "SELECT status FROM rounds WHERE round_no=?", (current_no,))
     if current is None:
         raise ValueError("当前回合不存在。")
