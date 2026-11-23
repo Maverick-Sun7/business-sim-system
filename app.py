@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import importlib
 import json
 import logging
@@ -39,7 +40,7 @@ from sim import genius as _genius_module
 # import one consistent version of the application.
 if (
     not hasattr(_db_module, "delete_city")
-    or getattr(_db_module, "DB_API_VERSION", 0) < 11
+    or getattr(_db_module, "DB_API_VERSION", 0) < 12
     or not hasattr(_engine_module, "current_company_net_assets")
     or not hasattr(_db_module, "rollback_latest_settled_round")
     or not hasattr(_db_module, "prepare_first_round_after_test")
@@ -80,6 +81,7 @@ from sim.remote_worker import (
 
 from sim.db import (
     all_rows,
+    apply_kds_preset,
     connect,
     current_round,
     database_bytes,
@@ -97,6 +99,7 @@ from sim.db import (
     reset_competition,
     rollback_latest_settled_round,
     restore_database_bytes,
+    save_kds_preset,
     set_setting,
     settings_dict,
     setup_status,
@@ -2690,12 +2693,73 @@ def render_admin_decisions() -> None:
         st.rerun()
 
 
+def render_kds_library(presets: list[sqlite3.Row], competition_started: bool) -> None:
+    st.subheader("KDS 预设库")
+    st.caption("预设保存全局 KDS 参数和整套城市配置。只在开赛前套用，不改赛程、队伍数量或已选主场。")
+    names = [row["name"] for row in presets]
+    if names:
+        name = st.selectbox("选择 KDS 预设", names, key="kds_preset_selection")
+        selected = next(row for row in presets if row["name"] == name)
+        snapshot = json.loads(selected["payload_json"])
+        st.caption(f"全局最高售价：¥{snapshot['settings']['price_max']:,}")
+        st.caption("包含城市：" + "、".join(row["city"] for row in snapshot["markets"]))
+        if st.button("套用所选 KDS", key="kds_preset_apply", type="primary", disabled=competition_started):
+            try:
+                with connect() as conn:
+                    apply_kds_preset(conn, name)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                flash("success", f"已套用「{name}」的全局与城市参数。")
+                st.rerun()
+        if st.checkbox("显示管理员备份下载", key="kds_preset_show_export"):
+            st.caption("备份含内部参数，只供管理员保存。对外请分享上面的公开 PDF。")
+            st.download_button(
+                "下载所选预设备份", json.dumps({"name": name, **snapshot}, ensure_ascii=False, indent=2),
+                file_name="KDS_Preset.json", mime="application/json", key="kds_preset_export",
+            )
+    if competition_started:
+        st.caption("比赛已开始：仍可保存和导入预设，但不能套用。")
+    with st.form("kds_preset_save", clear_on_submit=True):
+        new_name = st.text_input("新预设名称", help="保存的是数据库里已经生效的参数；请先保存下方尚未提交的修改。")
+        if st.form_submit_button("将当前 KDS 存为预设"):
+            try:
+                with connect() as conn:
+                    save_kds_preset(conn, new_name)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                flash("success", f"已保存 KDS 预设「{new_name.strip()}」。")
+                st.rerun()
+    with st.expander("导入 KDS 预设"):
+        imported = st.file_uploader("选择预设 JSON 文件", type=["json"], key="kds_preset_import_file")
+        import_name = st.text_input("导入名称（可留空，使用文件内名称）", key="kds_preset_import_name")
+        if st.button("导入到预设库", disabled=imported is None):
+            try:
+                if imported.size > 512 * 1024:
+                    raise ValueError("预设文件不能超过 512 KB。")
+                decoded = json.loads(imported.getvalue())
+                if not isinstance(decoded, dict) or not isinstance(import_name.strip() or decoded.get("name"), str):
+                    raise ValueError("缺少预设名称，请在上方填写。")
+                target = import_name.strip() or decoded["name"]
+                with connect() as conn:
+                    save_kds_preset(conn, target, decoded)
+            except (UnicodeError, json.JSONDecodeError, RecursionError):
+                st.error("无法读取预设文件，请使用有效的 UTF-8 JSON。")
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                flash("success", f"已导入「{target.strip()}」，当前比赛参数没有改变。")
+                st.rerun()
+
+
 def render_admin_kds() -> None:
     hero("KDS 设置", "修改将影响后续结算；已结算结果不会追溯变化。")
     with connect() as conn:
         settings = settings_dict(conn)
         markets = all_rows(conn, "SELECT * FROM market_config ORDER BY city")
         started_row = one(conn, "SELECT COUNT(*) AS n FROM rounds WHERE status<>'waiting' OR starts_at IS NOT NULL")
+        presets = all_rows(conn, "SELECT name,payload_json FROM kds_presets ORDER BY created_at,name")
     st.download_button(
         "下载公开 KDS PDF", build_public_kds_pdf(settings, markets),
         file_name="Public_KDS.pdf", mime="application/pdf", use_container_width=True,
@@ -2703,6 +2767,12 @@ def render_admin_kds() -> None:
     )
     st.caption("与玩家 KDS 页下载内容相同，采用当前已保存的公开参数。")
     competition_started = bool(started_row and int(started_row["n"]) > 0)
+    render_kds_library(presets, competition_started)
+    # A changed snapshot gets new widget keys, so other open admin sessions also
+    # discard stale field values and data-editor patches after switching presets.
+    revision = hashlib.sha256(json.dumps(
+        [[settings[key] for key in GLOBAL_SETTING_LABELS], [dict(row) for row in markets]], sort_keys=True,
+    ).encode()).hexdigest()[:16]
     unlocked = not competition_started or bool(st.session_state.get("admin_kds_unlocked"))
     if competition_started and not unlocked:
         st.warning("比赛已经开始，KDS 已锁定。输入 UNLOCK KDS 后才可编辑，修改只影响尚未结算的回合。")
@@ -2724,9 +2794,9 @@ def render_admin_kds() -> None:
             for offset, key in enumerate(items[start:start + 3]):
                 default = settings[key]
                 if isinstance(default, int):
-                    values[key] = cols[offset].number_input(GLOBAL_SETTING_LABELS[key], value=int(default), step=1, key=f"setting_{key}", disabled=not unlocked)
+                    values[key] = cols[offset].number_input(GLOBAL_SETTING_LABELS[key], value=int(default), step=1, key=f"setting_{revision}_{key}", disabled=not unlocked)
                 else:
-                    values[key] = cols[offset].number_input(GLOBAL_SETTING_LABELS[key], value=float(default), step=0.01 if abs(float(default)) < 2 else 100.0, format="%.4f" if abs(float(default)) < 2 else "%.2f", key=f"setting_{key}", disabled=not unlocked)
+                    values[key] = cols[offset].number_input(GLOBAL_SETTING_LABELS[key], value=float(default), step=0.01 if abs(float(default)) < 2 else 100.0, format="%.4f" if abs(float(default)) < 2 else "%.2f", key=f"setting_{revision}_{key}", disabled=not unlocked)
         save = st.form_submit_button("保存全局 KDS", type="primary", disabled=not unlocked)
     if save:
         if values["salary_min"] > values["salary_max"] or values["price_min"] > values["price_max"]:
@@ -2759,7 +2829,7 @@ def render_admin_kds() -> None:
             key: (st.column_config.CheckboxColumn(label) if key == "home_enabled" else st.column_config.Column(label))
             for key, label in MARKET_COLUMNS.items()
         },
-        key="market_editor",
+        key=f"market_editor_{revision}",
     )
     if st.button("保存全部城市参数", type="primary", disabled=not unlocked):
         numeric_columns = [column for column in frame.columns if column not in ("city", "home_enabled")]

@@ -13,12 +13,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .defaults import DEFAULT_MARKETS, DEFAULT_SETTINGS
+from .defaults import DEFAULT_MARKETS, DEFAULT_SETTINGS, GLOBAL_SETTING_LABELS
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.environ.get("SIM_DB_PATH", BASE_DIR / "data" / "sim.db"))
-DB_API_VERSION = 11
+DB_API_VERSION = 12
+OBOS_PRESET_NAME = "25人OBOS"
+SMALL_FIELD_PRESET_NAME = "3人2000场"
+KDS_SETTING_FIELDS = {key: label for key, label in GLOBAL_SETTING_LABELS.items()
+                      if key not in {"total_rounds", "round_duration_minutes"}}
+KDS_MARKET_FIELDS = (
+    "city", "home_enabled", "max_loan", "min_loan", "interest_rate",
+    "worker_initial_salary", "engineer_initial_salary", "component_material",
+    "product_material", "component_storage", "product_storage", "population",
+    "penetration", "initial_avg_price", "max_price", "transport_cost",
+    "worker_training_cost", "engineer_training_cost",
+)
 
 
 def now_iso() -> str:
@@ -99,6 +110,133 @@ def settings_dict(conn: sqlite3.Connection) -> dict[str, float | int | str]:
     return result
 
 
+def kds_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "settings": {key: get_setting(conn, key, DEFAULT_SETTINGS[key], type(DEFAULT_SETTINGS[key]))
+                     for key in KDS_SETTING_FIELDS},
+        "markets": [dict(row) for row in all_rows(
+            conn, f"SELECT {','.join(KDS_MARKET_FIELDS)} FROM market_config ORDER BY city"
+        )],
+    }
+
+
+def _kds_number(value: Any, label: str, *, integer: bool = False) -> float | int:
+    if type(value) not in (int, float) or not 0 <= value <= 9_007_199_254_740_991:
+        raise ValueError(f"{label} 必须是有效的非负数字。")
+    if integer and int(value) != value:
+        raise ValueError(f"{label} 必须是整数。")
+    return int(value) if integer else float(value)
+
+
+def _validate_kds_snapshot(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
+        raise ValueError("不支持的 KDS 文件版本。")
+    settings, markets = payload.get("settings"), payload.get("markets")
+    if not isinstance(settings, dict) or set(settings) != set(KDS_SETTING_FIELDS):
+        raise ValueError("KDS 全局参数不完整或包含未知字段，请使用本系统导出的预设 JSON。")
+    settings = {key: _kds_number(settings[key], label, integer=type(DEFAULT_SETTINGS[key]) is int)
+                for key, label in KDS_SETTING_FIELDS.items()}
+    positive = ("component_workers", "component_hours", "product_engineers", "product_hours",
+                "components_per_product", "loan_asset_threshold")
+    if any(settings[key] <= 0 for key in positive):
+        raise ValueError("生产配方和贷款净资产阈值必须大于 0。")
+    if settings["salary_min"] > settings["salary_max"] or settings["price_min"] > settings["price_max"]:
+        raise ValueError("工资或售价的最低值不能高于最高值。")
+    if not isinstance(markets, list) or not markets:
+        raise ValueError("KDS 必须包含至少一个城市。")
+    validated, cities = [], set()
+    for row in markets:
+        if not isinstance(row, dict) or set(row) != set(KDS_MARKET_FIELDS):
+            raise ValueError("城市参数不完整或包含未知字段。")
+        city = row["city"]
+        if not isinstance(city, str) or not city or city.strip() != city or city in cities:
+            raise ValueError("城市名称不能为空、重复或带首尾空格。")
+        record = {"city": city, **{
+            key: _kds_number(row[key], f"{city} · {key}", integer=key == "home_enabled")
+            for key in KDS_MARKET_FIELDS[1:]
+        }}
+        if record["home_enabled"] not in (0, 1) or record["min_loan"] > record["max_loan"]:
+            raise ValueError(f"{city} 的主场开关或贷款区间无效。")
+        cities.add(city)
+        validated.append(record)
+    return {"version": 1, "settings": settings, "markets": sorted(validated, key=lambda r: r["city"])}
+
+
+def save_kds_preset(conn: sqlite3.Connection, name: str, payload: Any = None) -> None:
+    name = name.strip()
+    if not 1 <= len(name) <= 80 or not name.isprintable():
+        raise ValueError("请输入 1–80 个字符的预设名称。")
+    if payload is None and not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    snapshot = _validate_kds_snapshot(kds_snapshot(conn) if payload is None else payload)
+    result = conn.execute(
+        "INSERT INTO kds_presets(name,payload_json,created_at) VALUES(?,?,?) ON CONFLICT(name) DO NOTHING",
+        (name, json.dumps(snapshot, ensure_ascii=False, allow_nan=False), now_iso()),
+    )
+    if not result.rowcount:
+        raise ValueError(f"预设「{name}」已经存在，请换一个名字。")
+
+
+def _seed_kds_presets(conn: sqlite3.Connection) -> None:
+    bundled = Path(__file__).with_name("kds_presets") / "obos25.json"
+    if bundled.is_file() and not one(conn, "SELECT 1 FROM kds_presets WHERE name=?", (OBOS_PRESET_NAME,)):
+        save_kds_preset(conn, OBOS_PRESET_NAME, json.loads(bundled.read_text(encoding="utf-8")))
+
+    # Identify the current small-field sheet from its public values, but save exclusively
+    # from the real database. Don't mislabel a fresh database or an older backup.
+    if one(conn, "SELECT 1 FROM kds_presets WHERE name=?", (SMALL_FIELD_PRESET_NAME,)):
+        return
+    snapshot = kds_snapshot(conn)
+    observed = [(r["city"], r["population"], r["initial_avg_price"], r["max_loan"]) for r in snapshot["markets"]]
+    formula_and_prices = ("component_workers", "component_hours", "product_engineers", "product_hours",
+                          "components_per_product", "price_min", "price_max")
+    if (observed == [("深圳", 1_500_000, 840, 2_400_000), ("苏州", 6_000_000, 710, 1_500_000)]
+            and tuple(snapshot["settings"][key] for key in formula_and_prices) == (3, 2, 1, 4, 2, 320, 2_000)):
+        # Preserve the exact saved snapshot, even if a legacy editor accepted a
+        # parameter that must be corrected before the preset can be applied.
+        conn.execute(
+            "INSERT INTO kds_presets(name,payload_json,created_at) VALUES(?,?,?) ON CONFLICT(name) DO NOTHING",
+            (SMALL_FIELD_PRESET_NAME, json.dumps(snapshot, ensure_ascii=False), now_iso()),
+        )
+
+
+def apply_kds_preset(conn: sqlite3.Connection, name: str) -> None:
+    conn.execute("BEGIN IMMEDIATE")
+    stored = one(conn, "SELECT payload_json FROM kds_presets WHERE name=?", (name,))
+    if stored is None:
+        raise ValueError("该预设已找不到，请重新选择。")
+    payload = _validate_kds_snapshot(json.loads(stored["payload_json"]))
+    if any(one(conn, sql) for sql in (
+        "SELECT 1 FROM rounds WHERE status<>'waiting' OR starts_at IS NOT NULL LIMIT 1",
+        "SELECT 1 FROM decisions LIMIT 1", "SELECT 1 FROM results LIMIT 1",
+        "SELECT 1 FROM city_results LIMIT 1", "SELECT 1 FROM market_round_stats LIMIT 1",
+    )):
+        raise ValueError("只能在开赛前套用预设；当前比赛或已有决策不会被覆盖。")
+    cities = {row["city"] for row in payload["markets"]}
+    homes = {row["city"] for row in payload["markets"] if row["home_enabled"]}
+    unavailable = {row["home_city"] for row in all_rows(
+        conn, "SELECT DISTINCT home_city FROM companies WHERE home_city IS NOT NULL AND home_city<>''"
+    )} - homes
+    if unavailable:
+        raise ValueError(f"已有队伍选择了预设不支持的主场：{'、'.join(sorted(unavailable))}。请先调整这些主场。")
+    if {row["city"] for row in all_rows(conn, "SELECT DISTINCT city FROM agents UNION SELECT DISTINCT city FROM city_decisions")} - cities:
+        raise ValueError("有 Agent 或城市决策仍关联被移除的城市，未套用预设。")
+    prior_cash = get_setting(conn, "initial_cash", DEFAULT_SETTINGS["initial_cash"])
+    for key, value in payload["settings"].items():
+        set_setting(conn, key, value)
+    assignments = ",".join(f"{field}=excluded.{field}" for field in KDS_MARKET_FIELDS[1:])
+    placeholders = ",".join("?" for _ in KDS_MARKET_FIELDS)
+    conn.executemany(
+        f"INSERT INTO market_config({','.join(KDS_MARKET_FIELDS)}) VALUES({placeholders}) "
+        f"ON CONFLICT(city) DO UPDATE SET {assignments}",
+        [tuple(row[field] for field in KDS_MARKET_FIELDS) for row in payload["markets"]],
+    )
+    conn.executemany("DELETE FROM market_config WHERE city=?", [(row["city"],) for row in all_rows(
+        conn, "SELECT city FROM market_config") if row["city"] not in cities])
+    conn.execute("UPDATE companies SET cash=? WHERE cash=?", (payload["settings"]["initial_cash"], prior_cash))
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(
@@ -106,6 +244,11 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS settings(
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS kds_presets(
+                name TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS companies(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -340,6 +483,7 @@ def init_db() -> None:
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 DEFAULT_MARKETS,
             )
+        _seed_kds_presets(conn)
         count = one(conn, "SELECT COUNT(*) AS n FROM companies")
         if count and int(count["n"]) == 0:
             initial_cash = float(DEFAULT_SETTINGS["initial_cash"])
