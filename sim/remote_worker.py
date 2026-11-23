@@ -8,7 +8,9 @@ import http.client
 import io
 import json
 import math
+import socket
 import sqlite3
+import ssl
 import threading
 import time
 import urllib.error
@@ -20,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .defaults import DEFAULT_SETTINGS
 
 PROTOCOL = 2
-REMOTE_API_VERSION = 5
+REMOTE_API_VERSION = 6
 TABLES = ("settings", "companies", "employee_cohorts", "market_config", "rounds",
           "decisions", "city_decisions", "agents", "results", "city_results", "market_round_stats")
 _LOCK = threading.Lock()
@@ -113,7 +115,7 @@ def remote_health(endpoints: str | list[str] | tuple[str, ...], timeout: float =
     def check(item: tuple[int, str]) -> dict:
         index, url = item
         started = time.perf_counter()
-        status = {"line": index + 1, "ok": False, "message": "连接失败或超时"}
+        status = {"line": index + 1, "ok": False, "error_code": "unreachable", "message": "连接失败或超时"}
         try:
             if not url.startswith("https://"):
                 raise ValueError("HTTPS required")
@@ -128,12 +130,21 @@ def remote_health(endpoints: str | list[str] | tuple[str, ...], timeout: float =
                 try:
                     check_calculation_revision(result)
                 except RemoteRevisionError:
-                    status["message"] = "已连通，但计算规则版本不兼容，请更新并重启计算节点"
+                    status.update(error_code="revision_mismatch", message="已连通，但计算规则版本不兼容，请更新并重启计算节点")
                 else:
-                    status.update(ok=True, message="已连通，计算规则版本一致")
+                    status.update(ok=True, error_code=None, message="已连通，计算规则版本一致")
             else:
-                status["message"] = "响应不是兼容的计算服务"
-        except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError, http.client.HTTPException):
+                status.update(error_code="incompatible_response", message="地址有响应，但不是兼容的计算服务")
+        except urllib.error.HTTPError as exc:
+            status.update(error_code="http_error", message=f"线路暂不可用（HTTP {exc.code}）")
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, ssl.SSLError):
+                status.update(error_code="tls_error", message="HTTPS 证书验证或握手失败")
+            elif isinstance(exc.reason, socket.gaierror):
+                status.update(error_code="dns_error", message="找不到线路地址（DNS 解析失败）")
+        except (json.JSONDecodeError, UnicodeError):
+            status.update(error_code="incompatible_response", message="地址有响应，但未返回计算服务状态")
+        except (OSError, ValueError, http.client.HTTPException):
             pass
         status["seconds"] = time.perf_counter() - started
         return status

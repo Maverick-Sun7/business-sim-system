@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import io
+import json
+from pathlib import Path
 import subprocess
+import sys
+import tempfile
 import unittest
 import zipfile
 
@@ -18,6 +22,8 @@ class LocalLauncherTest(unittest.TestCase):
             self.assertIn("worker_payload/sim/bots.py", archive.namelist())
             self.assertIn("worker_payload/sim/ai_training.py", archive.namelist())
             self.assertIn("worker_payload/sim/finance.py", archive.namelist())
+            self.assertIn("worker_payload/check_health.py", archive.namelist())
+            self.assertIn("worker_payload/start_background.py", archive.namelist())
             info = archive.getinfo("启动本地算力.command")
             self.assertEqual((info.external_attr >> 16) & 0o777, 0o755)
             script = archive.read(info).decode("utf-8")
@@ -43,6 +49,23 @@ class LocalLauncherTest(unittest.TestCase):
         self.assertNotIn("git clone", script)
         self.assertIn("不需要连接 GitHub", instructions)
         self.assertIn("不会闪退", instructions)
+        self.assertIn("已保留原有地址", script)
+
+    def test_health_check_rejects_stale_or_wrong_services(self):
+        from sim.local_launcher import build_local_worker_launcher_zip
+        from sim.remote_worker import PROTOCOL, calculation_revision
+
+        payload = {"ok": True, "protocol": PROTOCOL, "service": "business-sim-super-bot",
+                   "calculation_revision": calculation_revision()}
+        with tempfile.TemporaryDirectory() as temp, zipfile.ZipFile(io.BytesIO(build_local_worker_launcher_zip("test"))) as archive:
+            archive.extractall(temp)
+            checker = Path(temp) / "worker_payload/check_health.py"
+            for response, rc in ((payload, 0), (dict(payload, calculation_revision={"bot": -1}), 1),
+                                 (dict(payload, service="unrelated"), 1), (None, 1)):
+                with self.subTest(response=response):
+                    result = subprocess.run([sys.executable, str(checker)], input=json.dumps(response),
+                                            text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, rc, result.stderr)
 
 
 if __name__ == "__main__":

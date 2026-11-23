@@ -66,7 +66,7 @@ if getattr(_genius_module, "GENIUS_API_VERSION", 0) < 3:
 
 from sim.bots import finalize_super_bot_decisions, submit_bot_decisions
 from sim import remote_worker as _remote_worker_module
-if getattr(_remote_worker_module, "REMOTE_API_VERSION", 0) < 5:
+if getattr(_remote_worker_module, "REMOTE_API_VERSION", 0) < 6:
     importlib.invalidate_caches()
     importlib.reload(_remote_worker_module)
 from sim.remote_worker import (
@@ -138,6 +138,10 @@ from sim.report_pdf import build_round_report_pdf
 from sim.finance import asset_reconciliation, build_finance_ledger
 from sim.genius import has_genius_access, plan_genius_decision, set_genius_access, write_decision
 from sim.kds_pdf import build_public_kds_pdf
+from sim import local_launcher as _local_launcher_module
+if getattr(_local_launcher_module, "LAUNCHER_API_VERSION", 0) < 3:
+    importlib.invalidate_caches()
+    importlib.reload(_local_launcher_module)
 from sim.local_launcher import build_local_worker_launcher_zip
 
 
@@ -3018,9 +3022,9 @@ def render_admin_rounds(ai_mode: bool = False) -> None:
     remote_token = _deployment_secret("SUPER_BOT_REMOTE_TOKEN")
     if remote_token:
         st.download_button(
-            "下载 Mac 一键启动器（修复版）",
+            "下载 Mac 一键启动器（v3）",
             data=build_local_worker_launcher_zip(remote_token),
-            file_name="business-sim-local-worker-v2.zip",
+            file_name="business-sim-local-worker-v3.zip",
             mime="application/zip",
             key="download_local_compute_launcher",
             use_container_width=True,
@@ -3043,11 +3047,13 @@ def render_admin_rounds(ai_mode: bool = False) -> None:
     ):
         try:
             candidate_url = _normalise_local_worker_url(local_worker_input)
-            status = remote_health([candidate_url], timeout=2.5)[0]
+            status = remote_health([candidate_url], timeout=5)[0]
             if not status["ok"]:
-                if status.get("reachable"):
-                    raise ValueError("本地服务已连通，但计算规则版本不一致。请下载最新 Mac 启动器并重新启动，再连接新地址。")
-                raise ValueError("没有收到本地计算服务响应。请重新双击启动器，再粘贴新地址。")
+                if status.get("error_code") == "revision_mismatch":
+                    revision = status.get("calculation_revision")
+                    bot_version = f"（本机 Bot {revision['bot']}）" if isinstance(revision, dict) and type(revision.get("bot")) is int else ""
+                    raise ValueError(f"本地服务已连通，但规则版本不一致{bot_version}。请下载并运行新版 Mac 启动器。")
+                raise ValueError(f"{status['message']}。请确认 Mac 在线，再检查启动器显示的地址是否仍与这里一致。")
             with connect() as conn:
                 set_setting(conn, LOCAL_WORKER_URL_SETTING, candidate_url)
             flash("success", f"本地算力已连接并设为第 1 线路（{status['seconds']:.2f} 秒）。")
@@ -3065,7 +3071,7 @@ def render_admin_rounds(ai_mode: bool = False) -> None:
         flash("success", "本地算力线路已停用，云端备用线路保持不变。")
         st.rerun()
     if saved_local_worker_url:
-        st.info("本地算力已保存为第 1 线路。启动器关闭或 Mac 休眠后，需要重新启动并连接新地址。")
+        st.info("本地算力已保存为第 1 线路。Mac 休眠可能使连接中断；重新启动后，只有地址变了才需要重新连接。")
     if remote_config_error:
         st.warning(remote_config_error)
     elif compute_endpoints:
@@ -3073,7 +3079,7 @@ def render_admin_rounds(ai_mode: bool = False) -> None:
         if st.button("检测计算线路", key="check_compute_health"):
             with st.spinner("检测计算线路连通性…"):
                 try:
-                    statuses = remote_health(compute_endpoints, timeout=2.5)
+                    statuses = remote_health(compute_endpoints, timeout=5)
                 except Exception:
                     statuses = []
                     st.warning("暂时无法检测计算线路，请稍后重试。")

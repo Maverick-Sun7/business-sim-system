@@ -222,4 +222,17 @@ class RemoteFallbackTests(unittest.TestCase):
                     status = remote.remote_health([self.primary])[0]
                 self.assertTrue(status["reachable"])
                 self.assertFalse(status["ok"])
+                self.assertEqual(status["error_code"], "revision_mismatch")
                 self.assertIn("更新并重启", status["message"])
+
+    def test_health_does_not_call_invalid_response_or_edge_failure_a_stale_worker(self):
+        with patch.object(remote.urllib.request, "urlopen", return_value=io.BytesIO(b"<html>not a worker</html>")):
+            status = remote.remote_health([self.primary])[0]
+            self.assertEqual(status["error_code"], "incompatible_response")
+            self.assertNotIn("更新", status["message"])
+        with patch.object(remote.urllib.request, "urlopen",
+                          side_effect=urllib.error.HTTPError(self.primary, 530, "edge failure", None, None)):
+            status = remote.remote_health([self.primary])[0]
+            self.assertEqual(status["error_code"], "http_error")
+            self.assertIn("530", status["message"])
+            self.assertNotIn("更新", status["message"])

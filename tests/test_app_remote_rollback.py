@@ -162,7 +162,7 @@ class RemoteRollbackAppTests(unittest.TestCase):
         ):
             self.at.button(key="check_compute_health").click().run()
         self.assertFalse(self.at.exception)
-        health.assert_called_once_with(endpoints, timeout=2.5)
+        health.assert_called_once_with(endpoints, timeout=5.0)
         self.assertTrue(any("第 1 线路" in row.value and "已连通" in row.value for row in self.at.success))
         self.assertTrue(any("第 2 线路" in row.value and "连接失败" in row.value for row in self.at.warning))
 
@@ -174,7 +174,7 @@ class RemoteRollbackAppTests(unittest.TestCase):
         with patch("sim.remote_worker.remote_health", return_value=status) as health:
             self.at.button(key="connect_local_compute").click().run()
         self.assertFalse(self.at.exception)
-        health.assert_called_once_with([local_url], timeout=2.5)
+        health.assert_called_once_with([local_url], timeout=5.0)
         with self.db.connect() as conn:
             self.assertEqual(
                 self.db.get_setting(conn, "super_bot_local_worker_url", "", str),
@@ -240,10 +240,13 @@ class RemoteRollbackAppTests(unittest.TestCase):
     def test_pairing_stale_local_worker_reports_version_not_connection(self):
         self.prepare(super_bot=False)
         self.at.text_input(key="local_compute_url_input").set_value("https://stale-local.test").run()
-        stale = [{"line": 1, "ok": False, "reachable": True, "message": "版本不一致", "seconds": 0.01}]
+        stale = [{
+            "line": 1, "ok": False, "reachable": True, "message": "版本不一致", "seconds": 0.01,
+            "error_code": "revision_mismatch", "calculation_revision": {"bot": 40},
+        }]
         with patch("sim.remote_worker.remote_health", return_value=stale):
             self.at.button(key="connect_local_compute").click().run()
         self.assertFalse(self.at.exception)
-        self.assertTrue(any("已连通，但计算规则版本不一致" in row.value for row in self.at.error))
+        self.assertTrue(any("已连通，但规则版本不一致" in row.value and "Bot 40" in row.value for row in self.at.error))
         with self.db.connect() as conn:
             self.assertEqual(self.db.get_setting(conn, "super_bot_local_worker_url", "", str), "")
